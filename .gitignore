@@ -1,0 +1,34 @@
+# Compiled object files
+*.o
+*.obj
+
+# Executables
+*.exe
+*.out
+
+# Libraries
+*.lib
+*.dll
+*.so
+
+# Debugging files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Temporary and editor-specific files
+*~
+*.swp
+.DS_Store
+
+# Build directories (if applicable)
+/build/
+/bin/
+/obj/
+/.vscode/
+/archived/
+
+# Fastq Files
+*.fastq.gz
+*.csv
