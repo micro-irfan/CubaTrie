@@ -34,7 +34,7 @@ static size_t lcp(const char *a, const char *b) {
     return i;
 }
 
-void trie_insert(TrieNode *root, const char *seq, const char *sequence_name) {
+void trie_insert(TrieNode *root, const char *seq, const char *sequence_name, int rev) {
     TrieNode *node = root;
     size_t pos = 0, len = strlen(seq);
 
@@ -49,6 +49,7 @@ void trie_insert(TrieNode *root, const char *seq, const char *sequence_name) {
             node->child[idx]->name = strndup(sequence_name, strlen(sequence_name));
             node->child[idx]->seq = strndup(seq, len);
             node->child[idx]->seq_len = len;
+            node->child[idx]->rev = rev;
             return;
         }
 
@@ -96,6 +97,7 @@ void trie_insert(TrieNode *root, const char *seq, const char *sequence_name) {
             mid->name = strndup(sequence_name, strlen(sequence_name));
             mid->seq = strndup(seq, len);
             mid->seq_len = len;
+            mid->rev = rev;
         } else {
             int new_idx = nt2bits(*new_suffix);
             if (new_idx >= 0) {
@@ -105,6 +107,7 @@ void trie_insert(TrieNode *root, const char *seq, const char *sequence_name) {
                 mid->child[new_idx]->name = strndup(sequence_name, strlen(sequence_name));
                 mid->child[new_idx]->seq = strndup(seq, len);
                 mid->child[new_idx]->seq_len = len;
+                mid->child[new_idx]->rev = rev;
             }
         }
         return;
@@ -126,88 +129,101 @@ void trie_insert(TrieNode *root, const char *seq, const char *sequence_name) {
    When a terminal node is reached, we report a match.
 */
 
-void trie_search_exact(const TrieNode *root, const char *text, size_t min_len, kFoundVec *out) {
+void trie_search_exact(const TrieNode *root, 
+                       const char *text, size_t min_len, int k_mm,
+                       kFoundVec *out) 
+{
     size_t n = strlen(text);
-
-    // fprintf(stderr, "Searcing For %s w Len %u\n", text, n);
 
     for (size_t start = 0; start + min_len <= n; ++start) {
         const TrieNode *node = root;
         size_t cur = start;
+        int used = 0;
 
         while (cur < n) {
             int idx = nt2bits(text[cur]);
-
-            // invalid character
             if (idx < 0) break;                            
 
             const char *label = node->edge_label[idx];
-
-            // fprintf(stderr, "Searcing For %s, %s w Current Edge %s, %u, %u\n", text, text+cur, label, cur, idx);
-
-            // no edge from here
             if (!label) break;                            
             
-            // text too short for label
             size_t lablen = strlen(label);
-            if (cur + lablen > n) 
-                break;                  
+            // text too short for label
+            if (cur + lablen > n) break;
             
-            // fprintf(stderr, "Check1 %s, %s, %u\n", text + cur, label, lablen);
-            // edge label must match exactly
-            if (memcmp(text + cur, label, lablen) != 0)   
-                break;
+            // compare label with mismatches allowed
+            int mm = 0;
+            for (size_t j = 0; j < lablen; ++j) {
+                if (text[cur + j] != label[j]) {
+                    if (++mm > k_mm - used) { mm = k_mm + 1; break; }
+                }
+            }
+            if (mm > k_mm - used) break;
 
-            // fprintf(stderr, "Check2 %s, %s, %u\n", text + cur, label, lablen);
+            used += mm;
+            cur  += lablen;
+            node  = node->child[idx];
+
+            // full-sequence check not needed anymore (we already matched along the path),
+            // but keep it if your trie can have shared labels/aliases.
+            if (node->end && node->seq_len >= min_len) 
+                mv_push(out, (uint32_t)start, node->name, node->seq); 
+                
+            
+            // edge label must match exactly
+            // if (memcmp(text + cur, label, lablen) != 0)   
+            //     break;
             
             // consume edge and descend
-            cur += lablen;
-            node = node->child[idx];
+            // cur += lablen;
+            // node = node->child[idx];
 
             // if this node is terminal, we have an exact match of its full sequence
-            if (node->end && node->seq_len >= min_len) {
-                if (start + node->seq_len <= n &&
-                    memcmp(text + start, node->seq, node->seq_len) == 0) {
-                    mv_push(out, start, node->name, node->seq);
-                }
-                // continue; there might be a longer sequence sharing this path
-            }
+            // if (node->end && node->seq_len >= min_len) {
+            //     if (start + node->seq_len <= n &&
+            //         memcmp(text + start, node->seq, node->seq_len) == 0) {
+            //         mv_push(out, start, node->name, node->seq);
+            //     }
+            //     // continue; there might be a longer sequence sharing this path
+            // }
         }
     }
 }
 
 
-bool trie_prefix_search(const TrieNode *root, const char *text) {
+bool trie_prefix_search(const TrieNode *root,
+                        const uint64_t *b2, 
+                        size_t n) {
+
     const TrieNode *node = root;
-    size_t pos = 0, n = strlen(text);
+    size_t p = 0;
 
-    while (pos < n) {
-        int idx = nt2bits(text[pos]);
-        if (idx < 0) return false;                 // invalid char in query
+    while (p < n) {
+        uint32_t idx = (uint32_t)((*b2 >> (2 * (n - 1 - (int)p))) & 3u);
+        
+        if (idx < 0 || idx > 3) return false;                 
 
-        const char *label = node->edge_label[idx];
-        if (!label) return false;                  // no edge starting with this nt
+        const char *label = node->edge_label[idx];   // invalid char in query
+     
+        // no edge starting with this nt
+        if (!label) return false;                  
 
         size_t lablen = strlen(label);
         size_t i = 0;
 
-        // Compare query with the edge label
-        while (i < lablen && pos + i < n && text[pos + i] == label[i]) {
+        // Compare query with the edge label 
+        while (i < lablen && p + i < n && kmer2bit(*b2, n, p + i) == label[i]) {
             ++i;
         }
 
-        if (pos + i == n) {
-            // We consumed the whole query (possibly mid-edge) → query is a prefix
-            return true;
-        }
+        // whole query is consumed (possibly mid-edge) → query is a prefix
+        if (p + i == n) return true;
 
-        if (i < lablen) {
-            // Mismatch before finishing the edge and query still has chars → not a prefix
-            return false;
-        }
+        // Mismatch before finishing the edge and query still has chars → not a prefix
+        if (i < lablen) return false;
 
         // Full edge matched; descend and continue with remaining query
-        pos += lablen;
+        p += lablen;
         node = node->child[idx];
     }
 

@@ -6,8 +6,6 @@
 #include <stdint.h>
 #include "utils.h"
 
-
-
 /* Alphabet size for DNA (A,C,G,T) */
 #define ALPHABET_SIZE 4
 
@@ -28,14 +26,22 @@ typedef struct TrieNode {
 TrieNode *trie_create_node(void);
 
 /* Insert a DNA sequence with a name into the trie */
-void trie_insert(TrieNode *root, const char *seq, const char *sequence_name);
+void trie_insert(TrieNode *root, const char *seq, const char *sequence_name, int rev);
 
 /* Free the entire trie (all nodes + strings) */
 void trie_free_node(TrieNode *root);
 
 /* Check if `text` is a prefix of some stored sequence in the trie */
-bool trie_prefix_search(const TrieNode *root, const char *text);
+// bool trie_prefix_search(const TrieNode *root, const char *text);
 
-void trie_search_exact(const TrieNode *root, const char *text, size_t min_len, kFoundVec *out);
+bool trie_prefix_search(const TrieNode *root,
+                        const uint64_t *b2, 
+                        size_t n);
+
+void trie_search_exact(const TrieNode *root, 
+                       const char *text, 
+                       size_t min_len, int k_mm,  
+                       kFoundVec *out);
+
 
 #endif /* TRIE_H */

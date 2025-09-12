@@ -30,7 +30,8 @@ static void usage(const char *prog) {
         "  -o, --output FILE       output CSV (default: counts.csv)\n"
         "  -k, --kmer INT          k-mer length (default: 10)\n"
         "      --no-rc             Disable Reverse Complement (default off)\n"
-        "  -m, --mismatch INT      Number of mismatches allowed [0] (Currently Not Supported)\n"
+        "      --indels            Include Indels (default off) (Currently Not Supported)\n"
+        "  -m, --mismatch INT      Number of mismatches allowed [0] (Max 5 MMs allowed)\n"
         "  -t, --threads UINT      Number of threads [4] (Currently Not Supported)\n"
         "  -v                      Print Debugging Log Messages\n"
         "  -h, --help              show this help\n",
@@ -71,7 +72,8 @@ int parse_args(int argc, char **argv, Options *opt, int *pos_start) {
         case 't': opt->threads = atoi(o.arg); break;
         case 'm': 
             opt->mm = atoi(o.arg); 
-            if (opt->mm <= 0) opt->mm = 0;
+            if (opt->mm < 0) opt->mm = 0;
+            if (opt->mm > 5) opt->mm = 5;
             break;
         case 'v': opt->verbose++; break;
         case 301: opt->rc = 0; break;
@@ -96,7 +98,7 @@ void load_reference(const char *path, TrieNode *root, kh_counter_t *map,
                       size_t *min_out, size_t *max_out, size_t *n_out, int add_revcomp, size_t *kmer_len);
 
 void load_fastq(const char *path, TrieNode *root, kh_counter_t *counts,
-                int kmerlen, size_t *min_out, size_t *max_out);
+                int kmerlen, size_t *min_out, size_t *max_out, int k_mm);
 
 
 int main(int argc, char **argv) {
@@ -117,7 +119,7 @@ int main(int argc, char **argv) {
     printf("Inserted %zu sequences (forward & reverse count)\n", n);
 
     // Find Reference in Queries
-    load_fastq(opt.in, root, map, opt.k, &min_len, &max_len);
+    load_fastq(opt.in, root, map, opt.k, &min_len, &max_len, opt.mm);
 
     counter_write_csv_sorted_collapse_rc(map, opt.out, 0);
 

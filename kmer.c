@@ -3,10 +3,13 @@
 #include <stdint.h>
 #include <stdio.h>
 #include "kmer.h"
+#include "utils.h"
 
 // Trie API
 typedef struct TrieNode TrieNode;
-bool trie_prefix_search(const TrieNode *root, const char *kmer);
+bool trie_prefix_search(const TrieNode *root,
+                        const uint64_t *b2, 
+                        size_t n);
 
 // comparator for qsort (ascending)
 static int cmp_u32_asc(const void *a, const void *b) {
@@ -24,10 +27,36 @@ static char *dup_cstr_n(const char *s, size_t n) {
 }
 
 
+
+// reverse-complement a 2-bit base
+static inline uint64_t rc2(uint64_t b){ return (~b) & 3; }
+
+static inline uint64_t hash64(uint64_t x) {
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
+    return x ^ (x >> 33);
+}
+
+
+
+// Pack text[0..n) into 2-bit words (LSB-first). Also fill ambig-mask (1 bit per base) if provided.
+static inline int encode_kmer(const char *s, size_t n, uint64_t *out) {
+    uint64_t code = 0;
+    for (size_t i = 0; i < n; ++i) {
+        int b = nt2bits(s[i]);
+        if (b < 0) return -1;
+        code = (code << 2) | (uint64_t)b;
+
+    }
+
+    *out = code;
+    return 0;
+}
+
 void find_kmer(const char *s, const size_t s_len, 
                const TrieNode *trie,
-               khash_t(strset) *kmer_hit,
-               khash_t(strset) *kmer_search,
+               khash_t(kset64) *kmer_hit,
+               khash_t(kset64) *kmer_search,
                size_t k,
                u32vec_t *hits) {
 
@@ -37,28 +66,35 @@ void find_kmer(const char *s, const size_t s_len,
         // Build a temp key buffer for lookup (NUL-terminated)
         char *kmer = dup_cstr_n(s + i, (size_t)k);
         if (!kmer) { /* OOM */ break; }
-        
-        // if Kmer in kmer_hit; add pos to check
-        if (kh_get(strset, kmer_hit, kmer) != kh_end(kmer_hit)) {
+
+        printf("%s %d\n", kmer, i);
+
+        uint64_t code;
+        int n_found = encode_kmer(kmer, k, &code);
+        free(kmer);
+
+        if (n_found < 0) continue;
+
+        if (kh_get(kset64, kmer_hit, (khint64_t)code) != kh_end(kmer_hit)) {
             kv_push(uint32_t, 0, *hits, i);
             continue;
         }
 
         // if kmer in searched cache; continue
-        if (kh_get(strset, kmer_search, kmer) != kh_end(kmer_search)) {
+        if (kh_get(kset64, kmer_search, (khint64_t)code) != kh_end(kmer_search)) {
             continue;
         }
 
-        if (trie_prefix_search(trie, kmer)) {
+        if (trie_prefix_search(trie, &code, k)) {
             kv_push(uint32_t, 0, *hits, i);
             int ret;
-            khiter_t hk = kh_put(strset, kmer_hit, kmer, &ret);
-            if (ret > 0) kh_key(kmer_hit, hk) = strdup(kmer); // non-owning: reuse pointer
+            khiter_t sk = kh_put(kset64, kmer_hit, (khint64_t)code, &ret);
+            if (ret > 0) kh_key(kmer_hit, sk) = (khint64_t)code;
         }
 
         int ret;
-        khiter_t sk = kh_put(strset, kmer_search, kmer, &ret);
-        if (ret > 0) kh_key(kmer_search, sk) = strdup(kmer);
+        khiter_t sk = kh_put(kset64, kmer_search, (khint64_t)code, &ret);
+        if (ret > 0) kh_key(kmer_search, sk) = (khint64_t)code;
     }
 
     // sort hits (ascending)
@@ -92,7 +128,8 @@ void find_matches(const char *sequence, size_t seq_len,
                   const u32vec_t *hit,
                   uint32_t min_len, uint32_t max_len,
                   const TrieNode *trie,
-                  khash_t(strset) *found_sequences)
+                  khash_t(strset) *found_sequences,
+                  int k_mm)
 {
     khash_t(posset) *start_pos_cache = kh_init(posset);   // dedupe absolute start positions
     kFoundVec matches; kv_init(matches);
@@ -100,15 +137,10 @@ void find_matches(const char *sequence, size_t seq_len,
     for (size_t idx = 0; idx < hit->n; ++idx) {
         uint32_t h = hit->a[idx];
 
-        //fprintf(stderr, "1 Looking For At Pos %u,%u,%u,%u\n", h, h + max_len, h + min_len, seq_len);
-
         if ((size_t)h + (size_t)min_len > seq_len) continue;
-
-        // fprintf(stderr, "2 Looking For At Pos %u,%u,%u,%u\n", h, h + max_len, h + min_len, seq_len);
 
         size_t qlen = (size_t)max_len;
         if ((size_t)h + qlen > seq_len) 
-            // qlen = seq_len - (size_t)h;
             continue;
 
         // call trie, gather matches for this slice
@@ -119,13 +151,14 @@ void find_matches(const char *sequence, size_t seq_len,
         memcpy(slice, sequence + h, max_len);
         slice[max_len] = '\0';
 
-        trie_search_exact(trie, slice, min_len, &matches);
+        normalize_acgt(slice);
 
-        //fprintf(stderr, "Number of Matches: %u\n", matches.n);
-        
+        // printf("%s at position %d \n", slice, h);
+
+        trie_search_exact(trie, slice, min_len, k_mm, &matches);
+
         for (size_t m = 0; m < matches.n; ++m) {
             uint32_t abs_start = matches.a[m].pos + h;
-            //fprintf(stderr, "Matches Start Pos: %u\n", abs_start);
 
             // if abs_start in start_pos_cache: continue
             khiter_t it = kh_get(posset, start_pos_cache, (khint_t)abs_start);
@@ -147,7 +180,6 @@ void find_matches(const char *sequence, size_t seq_len,
         }
 
         free(slice);
-
     }
 
     kv_destroy(matches);

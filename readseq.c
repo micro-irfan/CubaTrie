@@ -11,13 +11,6 @@ KSEQ_INIT(gzFile, gzread)
 #include "utils.h"
 #include "kmer.h"
 
-static void normalize_acgt(char *s) {
-    for (char *p = s; *p; ++p) {
-        if (*p == 'u' || *p == 'U') *p = 'T';
-        else *p = (char)toupper((unsigned char)*p);
-    }
-}
-
 static char *revcomp_new_n(const char *s, size_t n) {
     char *rc = (char*)malloc(n + 1);
     if (!rc) return NULL;
@@ -31,19 +24,22 @@ static char *revcomp_new_n(const char *s, size_t n) {
     return rc;
 }
 
+const size_t STEP = 1000000;
 
-void strset_dump(const khash_t(strset) *S, FILE *out)
-{
-    fprintf(out, "# %zu items\n", (size_t)kh_size(S));
-    for (khiter_t it = kh_begin(S); it != kh_end(S); ++it) {
-        if (!kh_exist(S, it)) continue;
-        fprintf(out, "%s\n", kh_key(S, it));
-    }
+void total_hits (const kh_counter_t *m, const size_t nreads) {
+    size_t total = 0;
+    for (khint_t i = kh_begin(m); i != kh_end(m); ++i) 
+        if (kh_exist(m, i)) total += kh_val(m, i);
+
+    fprintf(stderr, "Finished Processing %zu reads...\n", nreads);
+
+    double pct = nreads ? 100.0 * (double)total / (double)nreads : 0.0;
+    fprintf(stderr, "Reads with matches: %zu (%.2f%%)\n", total, pct);
 }
 
 
 void load_fastq(const char *path, TrieNode *root, kh_counter_t *counts,
-                int kmerlen, size_t *min_len, size_t *max_len) {
+                int kmerlen, size_t *min_len, size_t *max_len, int k_mm) {
 
     gzFile fp = gzopen(path, "rb");
     if (fp == 0) { perror("gzopen"); return 0; }
@@ -51,13 +47,16 @@ void load_fastq(const char *path, TrieNode *root, kh_counter_t *counts,
     kseq_t *ks = kseq_init(fp);
     if (!ks) { gzclose(fp); return 0; }
 
+    size_t nreads = 0;
     int l;
-    khash_t(strset) *kmer_hit = kh_init(strset);
-    khash_t(strset) *searched = kh_init(strset);
+    khash_t(kset64) *kmer_hit = kh_init(kset64), *searched = kh_init(kset64);
+
     while ((l = kseq_read(ks)) >= 0) {
-        normalize_acgt(ks->seq.s);
-        
-        // Check against previous record OR Trie (For new Kmers) if Kmer exists 
+        if (++nreads % STEP == 0) {
+            fprintf(stderr, "processing %zu reads...\r", nreads);
+            fflush(stderr); 
+        }
+
         kvec_t(uint32_t) hits; kv_init(hits);
         find_kmer(ks->seq.s, 
                   ks->seq.l, 
@@ -66,6 +65,11 @@ void load_fastq(const char *path, TrieNode *root, kh_counter_t *counts,
                   searched,
                   kmerlen,
                   &hits);
+
+        if (hits.n == 0) {
+            kv_destroy(hits);
+            continue;
+        } 
 
         khash_t(strset) *matches = kh_init(strset);
         if (!matches) { perror("kh_init"); return 1; }
@@ -78,7 +82,8 @@ void load_fastq(const char *path, TrieNode *root, kh_counter_t *counts,
             *min_len, 
             *max_len,
             root, 
-            matches
+            matches,
+            k_mm
         );
 
         add_to_counter(matches, counts);
@@ -87,10 +92,11 @@ void load_fastq(const char *path, TrieNode *root, kh_counter_t *counts,
         kh_destroy(strset, matches);
     }
 
-    fprintf(stderr, "Completed!\n");
+    total_hits (counts, nreads);
+
     kseq_destroy(ks);
-    kh_destroy(strset, kmer_hit);
-    kh_destroy(strset, searched);
+    kh_destroy(kset64, kmer_hit);
+    kh_destroy(kset64, searched);
     return 0;
 }
 
@@ -140,7 +146,7 @@ void load_reference(const char *path, TrieNode *root, kh_counter_t *map,
         }
         name_buf[i] = '\0';
 
-        trie_insert(root, seq, name_buf);
+        trie_insert(root, seq, name_buf, 0);
         counter_inc(map, name_buf);
         inserted++;
 
@@ -149,7 +155,7 @@ void load_reference(const char *path, TrieNode *root, kh_counter_t *map,
             if (rc) {
                 char rcname[256];
                 snprintf(rcname, sizeof(rcname), "%s/rc", name_buf);
-                trie_insert(root, rc, rcname);
+                trie_insert(root, rc, rcname, 1);
                 counter_inc(map, rcname);
                 inserted++;
                 free(rc);

@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <ctype.h>
 
 void mv_init(kFoundVec *mv) { mv->a=NULL; mv->n=mv->m=0; }
 void mv_push(kFoundVec *mv, size_t pos, const char *name, const char *seq) {
@@ -119,8 +120,17 @@ static int write_map_sorted_csv_(const kh_counter_t *m, const char *path, size_t
     /* sort & write */
     qsort(arr, n, sizeof(*arr), cmp_count_desc_then_key_asc);
     size_t limit = (topk > 0 && topk < n) ? topk : n;
-    for (size_t i = 0; i < limit; ++i)
+    size_t hit = 0;
+    for (size_t i = 0; i < limit; ++i) {
+        if (arr[i].count > 0) ++hit;
         fprintf(fp, "%s,%zu\n", arr[i].key, arr[i].count);
+    }
+    
+    fprintf(stderr, "\nSummary:\nTotal sequences searched: %zu \n", n);
+    fprintf(stderr, "Sequences with hits: %zu \n", hit);
+    fprintf(stderr, "Results Written to %s \n", path);
+    
+    
 
     free(arr);
     if (fp != stdout) fclose(fp);
@@ -168,4 +178,18 @@ int counter_write_csv_sorted_collapse_rc(const kh_counter_t *m, const char *path
     kh_destroy(counter, agg);
 
     return rc;
+}
+
+
+
+
+
+// Extract 2-bit base at position i (0..3). Assumes same packing as above.
+static inline uint32_t get2(const uint64_t *text, size_t i) {
+    return (text[i >> 5] >> ((i & 31) * 2)) & 3U;
+}
+
+// Check if base i is ambiguous (N). Only if you built a mask.
+static inline int isN(const uint64_t *mask, size_t i) {
+    return mask ? (int)((mask[i >> 6] >> (i & 63)) & 1U) : 0;
 }

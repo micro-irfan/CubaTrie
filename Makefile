@@ -22,11 +22,11 @@ CPPFLAGS += -MMD -MP              # auto deps
 SAN      = -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
 
 # ---- modes ----
-MODE ?= debug
+MODE ?= release
 ifeq ($(MODE),debug)
   CFLAGS  += -g3 -O0 $(SAN) -D_POSIX_C_SOURCE=200809L
 else ifeq ($(MODE),release)
-  CFLAGS  += -O3 -g -D_POSIX_C_SOURCE=200809L
+  CFLAGS  += -O3 -g -D_POSIX_C_SOURCE=200809L -march=native -DNDEBUG
 endif
 
 CFLAGS  += $(CSTD) $(WARN)

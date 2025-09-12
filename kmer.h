@@ -10,6 +10,8 @@ typedef kvec_t(uint32_t) u32vec_t;
 
 // Map: char* (k-mer) -> vector of uint32_t positions
 KHASH_MAP_INIT_STR(k2pos, u32vec_t)
+KHASH_MAP_INIT_INT64(k2pos64, u32vec_t)   // map: uint64_t -> positions
+KHASH_SET_INIT_INT64(kset64)         // set<uint64_t>
 
 // Sets of strings
 KHASH_SET_INIT_INT(posset)    // set<uint32_t> 
@@ -19,8 +21,8 @@ KHASH_SET_INIT_STR(strset)    // set<char*>
 
 void find_kmer(const char *s, const size_t s_len, 
                const TrieNode *trie,
-               khash_t(strset) *kmer_hit,
-               khash_t(strset) *kmer_search,
+               khash_t(kset64) *kmer_hit,
+               khash_t(kset64) *kmer_search,
                size_t k,
                u32vec_t *hits);                    
 
@@ -32,4 +34,5 @@ void find_matches(const char *sequence, size_t seq_len,
                   const u32vec_t *hit,
                   uint32_t min_len, uint32_t max_len,
                   const TrieNode *trie,
-                  khash_t(strset) *found_sequences);
+                  khash_t(strset) *found_sequences, 
+                  int k_mm);

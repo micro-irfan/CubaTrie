@@ -23,7 +23,8 @@ void counter_free(kh_counter_t *m);   // frees keys + destroys map
 typedef struct {
     size_t pos; 
     char   *seq;  
-    char   *name;      
+    char   *name; 
+    int    mm;
 } Match ;
 
 // typedef struct {
@@ -47,22 +48,53 @@ void mv_push(kFoundVec *mv, size_t pos, const char *name, const char *seq) ;
 void mv_free(kFoundVec *mv);
 
 
-/* Map nucleotide char to 2-bit code: A=0, C=1, G=2, T=3, else -1 */
-static inline int nt2bits(char c) {
-    switch (c) {
-        case 'A': case 'a': return 0;
-        case 'C': case 'c': return 1;
-        case 'G': case 'g': return 2;
-        case 'T': case 't': return 3;
-        default:            return -1;
+static inline void normalize_acgt(char *s) {
+    for (char *p = s; *p; ++p) {
+        unsigned char c = (unsigned char)*p;
+        if (c == 'u' || c == 'U') { *p = 'T'; continue; }
+        if (c >= 'a' && c <= 'z') c -= 32;        // uppercase letters only
+        // keep only A/C/G/T/N; collapse others to 'N'
+        switch (c) {
+            case 'A': case 'C': case 'G': case 'T': case 'N': *p = (char)c; break;
+            default: *p = 'N'; break;
+        }
     }
 }
 
 
-static inline char bits2nt(int b) {
-    static const char map[4] = {'A','C','G','T'};
-    return (b>=0 && b<4) ? map[b] : 'N';
+static inline char bits2nt(uint32_t b) {
+    static const char LUT[4] = {'A','C','G','T'};
+    return LUT[b & 3u];
 }
+
+// Return base at index i (0..k-1), where i=0 is the first char encoded
+static inline char kmer2bit(uint64_t code, int k, size_t i) {
+    if ((int)i >= k) return '?';  // out of range
+    uint32_t bits = (uint32_t)((code >> (2 * (k - 1 - (int)i))) & 3u);
+    return bits2nt(bits);
+}
+
+
+static inline uint32_t get2(const uint64_t *text, size_t i);
+static inline int isN(const uint64_t *mask, size_t i);
+
+
+
+// Map ASCII to 2-bit: A=0,C=1,G=2,T/U=3; return -1 for N/ambiguous
+static inline int nt2bits(char c) {
+    switch (c & ~32) { // uppercase
+        case 'A': return 0;
+        case 'C': return 1;
+        case 'G': return 2;
+        case 'T': case 'U': return 3;
+        default:  return -1;
+    }
+}
+
+// static inline char bits2nt(int b) {
+//     static const char map[4] = {'A','C','G','T'};
+//     return (b>=0 && b<4) ? map[b] : 'N';
+// }
 
 // static size_t strnlen(const char *s, size_t n) {
 //     size_t i = 0;

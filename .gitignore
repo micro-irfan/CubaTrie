@@ -32,3 +32,6 @@
 # Fastq Files
 *.fastq.gz
 *.csv
+*.sam
+
+cuba_trie
