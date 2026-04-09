@@ -5,10 +5,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [v0.0.2]
-* Create a Kmer HashSet to check if prefix exist in the Compressed Radix Trie 
-* Allow Mismatches For trie_search_exact func (Mismatches for Prefix Search Disallowed)
-* Option to Output a SAM File. NM and NH tags are included 
-* Add an option to ignore reverse complementary sequences in short sequence reference
+* Create a Kmer HashSet to check if prefix exist in the Compressed Radix Trie .
+* Allow Mismatches For trie_search_exact func (Mismatches for Prefix Search Disallowed).
+* Option to Output a SAM File. NM and NH tags are included.
+* Added an option to ignore reverse complementary sequences in short sequence reference.
+* Added /tests  
 
 ## [v0.0.1]
 * Initial release of cuba trie - beta version, only exact match, and unoptimized
