@@ -5,7 +5,7 @@
 #include <ctype.h>
 
 void mv_init(kFoundVec *mv) { mv->a=NULL; mv->n=mv->m=0; }
-void mv_push(kFoundVec *mv, size_t pos, const char *name, const char *seq) {
+void mv_push(kFoundVec *mv, size_t pos, const char *name, const char *seq, int mm) {
     if (mv->n == mv->m) {
         size_t nm = mv->m ? mv->m<<1 : 8;
         Match *p = (Match*)realloc(mv->a, nm*sizeof *p);
@@ -15,6 +15,7 @@ void mv_push(kFoundVec *mv, size_t pos, const char *name, const char *seq) {
     mv->a[mv->n].pos = pos;
     mv->a[mv->n].name = strndup(name, strlen(name)); 
     mv->a[mv->n].seq = strndup(seq, strlen(seq));
+    mv->a[mv->n].mm = mm;
     mv->n++;
 }
 void mv_free(kFoundVec *mv) {

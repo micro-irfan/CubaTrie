@@ -26,6 +26,8 @@ void find_kmer(const char *s, const size_t s_len,
                size_t k,
                u32vec_t *hits);                    
 
+khash_t(kset64) *kmer_set_from_trie(const TrieNode *root, size_t k);
+
 
 void add_to_counter(khash_t(strset) *found_sequences,
                     kh_counter_t *map);
@@ -35,4 +37,7 @@ void find_matches(const char *sequence, size_t seq_len,
                   uint32_t min_len, uint32_t max_len,
                   const TrieNode *trie,
                   khash_t(strset) *found_sequences, 
-                  int k_mm);
+                  int k_mm,
+                  const char *read_name,
+                  const char *read_qual,
+                  FILE *sam_fp);

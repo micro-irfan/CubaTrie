@@ -44,7 +44,7 @@ typedef kvec_t(Match) kFoundVec;
 /* -------- MATCH RESULTS CONTAINER -------- */
 
 void mv_init(kFoundVec *mv);
-void mv_push(kFoundVec *mv, size_t pos, const char *name, const char *seq) ;
+void mv_push(kFoundVec *mv, size_t pos, const char *name, const char *seq, int mm);
 void mv_free(kFoundVec *mv);
 
 
@@ -67,6 +67,7 @@ static inline char bits2nt(uint32_t b) {
     return LUT[b & 3u];
 }
 
+
 // Return base at index i (0..k-1), where i=0 is the first char encoded
 static inline char kmer2bit(uint64_t code, int k, size_t i) {
     if ((int)i >= k) return '?';  // out of range
@@ -78,11 +79,9 @@ static inline char kmer2bit(uint64_t code, int k, size_t i) {
 static inline uint32_t get2(const uint64_t *text, size_t i);
 static inline int isN(const uint64_t *mask, size_t i);
 
-
-
 // Map ASCII to 2-bit: A=0,C=1,G=2,T/U=3; return -1 for N/ambiguous
 static inline int nt2bits(char c) {
-    switch (c & ~32) { // uppercase
+    switch (c & ~32) { 
         case 'A': return 0;
         case 'C': return 1;
         case 'G': return 2;
@@ -90,29 +89,6 @@ static inline int nt2bits(char c) {
         default:  return -1;
     }
 }
-
-// static inline char bits2nt(int b) {
-//     static const char map[4] = {'A','C','G','T'};
-//     return (b>=0 && b<4) ? map[b] : 'N';
-// }
-
-// static size_t strnlen(const char *s, size_t n) {
-//     size_t i = 0;
-//     while (i < n && s[i] != '\0') {
-//         i++;
-//     }
-//     return i;
-// }
-
-// char *strndup(const char *s, size_t n) {
-//     size_t len = strnlen(s, n);
-//     char *copy = malloc(len + 1);
-//     if (copy) {
-//         memcpy(copy, s, len);
-//         copy[len] = '\0';
-//     }
-//     return copy;
-// }
 
 typedef struct {
     const char *key;
