@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * Added direct-access seed-to-trie cursor table for continuation from seed depth.
 * Improved SAM write performance in multithreaded mode using a dedicated writer queue.
 * Increased SAM output buffering (`setvbuf`) to reduce flush overhead.
+* Reduced multithreaded no-SAM overhead by skipping per-read `qname/qual` copies.
 
 ## [v0.0.2]
 * Create a Kmer HashSet to check if prefix exist in the Compressed Radix Trie.

@@ -27,7 +27,7 @@ static char *revcomp_new_n(const char *s, size_t n) {
 }
 
 const size_t STEP = 1000000;
-static const size_t MT_QUEUE_CAPACITY = 4096;
+static const size_t MT_QUEUE_CAPACITY = 16384;
 
 static size_t qname_len_no_rc(const char *name) {
     if (!name) return 0;
@@ -753,12 +753,14 @@ static int load_fastq_mt(const char *path,
     if (status == 0) {
         while ((l = kseq_read(ks)) >= 0) {
             FastqTask task = {0};
-            task.name = dup_cstr_n(ks->name.s, ks->name.l);
             task.seq = dup_cstr_n(ks->seq.s, ks->seq.l);
-            task.qual = ks->qual.l ? dup_cstr_n(ks->qual.s, ks->qual.l) : NULL;
             task.len = ks->seq.l;
+            if (use_sam_writer) {
+                task.name = dup_cstr_n(ks->name.s, ks->name.l);
+                task.qual = ks->qual.l ? dup_cstr_n(ks->qual.s, ks->qual.l) : NULL;
+            }
 
-            if (!task.name || !task.seq || (ks->qual.l && !task.qual)) {
+            if (!task.seq || (use_sam_writer && (!task.name || (ks->qual.l && !task.qual)))) {
                 free_fastq_task(&task);
                 status = 1;
                 fastq_queue_request_abort(&queue);
