@@ -81,6 +81,37 @@ static void test_trie_search_exact_mm(void) {
     trie_free_node(root);
 }
 
+static void test_find_kmer_bitset_seed_mm(void) {
+    TrieNode *root = trie_create_node();
+    assert(root != NULL);
+    assert(trie_insert(root, "ACGT", "seedRef", 0) == TRIE_INSERT_OK);
+
+    KmerBitset *index = kmer_bitset_from_trie(root, 4);
+    assert(index != NULL);
+
+    u32vec_t hits;
+    kv_init(hits);
+
+    find_kmer_bitset("AACGTAA", 7, index, 0, &hits);
+    assert(hits.n == 1);
+    assert(hits.a[0] == 1);
+    kv_destroy(hits);
+
+    kv_init(hits);
+    find_kmer_bitset("AACCTAA", 7, index, 0, &hits);
+    assert(hits.n == 0);
+    kv_destroy(hits);
+
+    kv_init(hits);
+    find_kmer_bitset("AACCTAA", 7, index, 1, &hits);
+    assert(hits.n == 1);
+    assert(hits.a[0] == 1);
+    kv_destroy(hits);
+
+    kmer_bitset_destroy(index);
+    trie_free_node(root);
+}
+
 static void test_find_matches_sam_line(void) {
     TrieNode *root = trie_create_node();
     assert(root != NULL);
@@ -174,6 +205,7 @@ static void test_sam_header_strip_and_dedupe(void) {
 int main(void) {
     test_trie_insert_statuses();
     test_trie_search_exact_mm();
+    test_find_kmer_bitset_seed_mm();
     test_find_matches_sam_line();
     test_find_matches_multihit_qname_tag();
     test_sam_header_strip_and_dedupe();

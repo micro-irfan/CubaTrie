@@ -25,6 +25,7 @@ CPPFLAGS += -MMD -MP              # auto deps
 
 # ---- sanitizers (used in debug) ----
 SAN      = -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
+THREAD_FLAGS = -pthread
 
 # ---- modes ----
 MODE ?= release
@@ -34,8 +35,8 @@ else ifeq ($(MODE),release)
   CFLAGS  += -O3 -g -D_POSIX_C_SOURCE=200809L -march=native -DNDEBUG
 endif
 
-CFLAGS  += $(CSTD) $(WARN)
-LDFLAGS +=
+CFLAGS  += $(CSTD) $(WARN) $(THREAD_FLAGS)
+LDFLAGS += $(THREAD_FLAGS)
 LDLIBS  += -lz                     # zlib
 
 # ---- rules ----
@@ -78,4 +79,4 @@ golden-test: $(GOLDEN_TEST_TARGET)
 $(GOLDEN_TEST_TARGET): $(GOLDEN_TEST_SRCS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(GOLDEN_TEST_SRCS) $(LDLIBS)
 
--include $(DEPS)
+-include $(DEPS) $(TEST_DEPS)

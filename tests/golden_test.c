@@ -10,7 +10,8 @@ int load_reference(const char *path, TrieNode *root, kh_counter_t *map,
                    size_t *min_out, size_t *max_out, size_t *n_out,
                    int add_revcomp, size_t *kmer_len, TrieDupPolicy dup_policy);
 int load_fastq(const char *path, TrieNode *root, kh_counter_t *counts,
-               int kmerlen, size_t *min_len, size_t *max_len, int k_mm, FILE *sam_fp);
+               int kmerlen, int seed_mm, size_t *min_len, size_t *max_len, int k_mm, FILE *sam_fp,
+               unsigned threads);
 
 static int file_exists(const char *path) {
     FILE *fp = fopen(path, "rb");
@@ -114,7 +115,7 @@ int main(void) {
     }
     trie_write_sam_header(sam_fp, root);
 
-    rc = load_fastq(reads_path, root, map, (int)kmer_len, &min_len, &max_len, 0, sam_fp);
+    rc = load_fastq(reads_path, root, map, (int)kmer_len, 0, &min_len, &max_len, 0, sam_fp, 1);
     fclose(sam_fp);
     if (rc != 0) {
         fprintf(stderr, "ERROR: load_fastq failed (rc=%d)\n", rc);

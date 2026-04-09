@@ -4,12 +4,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.0.3]
+* Added multi-threaded read processing in `load_fastq` via `-t/--threads`.
+* Added thread-safe SAM output flushing for mapped and unmapped records.
+* Added pthread flags to build/link steps in `Makefile`.
+* Replaced hash-set seed prefilter with a bitset seed index.
+* Added seed mismatch option `--seed-mm` with allowed values `0|1`.
+* Updated default seed k-mer length to `8` with max `12`.
+* Added direct-access seed-to-trie cursor table for continuation from seed depth.
+* Improved SAM write performance in multithreaded mode using a dedicated writer queue.
+* Increased SAM output buffering (`setvbuf`) to reduce flush overhead.
+
 ## [v0.0.2]
-* Create a Kmer HashSet to check if prefix exist in the Compressed Radix Trie .
+* Create a Kmer HashSet to check if prefix exist in the Compressed Radix Trie.
 * Allow Mismatches For trie_search_exact func (Mismatches for Prefix Search Disallowed).
-* Option to Output a SAM File. NM and NH tags are included.
+* Option to Output SAM File. NM and NH tags are included.
 * Added an option to ignore reverse complementary sequences in short sequence reference.
-* Added unit test to /tests  
+* Added unit test to /tests directory.
 
 ## [v0.0.1]
-* Initial release of cuba trie - beta version, only exact match, and unoptimized
+* Initial release of cuba trie - beta version, only exact match, and unoptimized.

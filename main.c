@@ -7,9 +7,7 @@
 
 /*
 TODO: Allow For Mismatches
-TODO: Switch to Bits
 TODO: Check For Anchors - if reverse complimentary is found
-TODO: Allow for threading option
 */
 
 typedef struct {
@@ -17,7 +15,8 @@ typedef struct {
     const char *ref;   // -r/--reference
     const char *out;         // -o/--output  ("-" means stdout)
     const char *sam;         // --sam FILE (or "-")
-    int k;                   // -k/--kmer
+    int k;                   // -k/--kmer (seed k)
+    int seed_mm;             // --seed-mm
     int rc; 
     int verbose;
     int mm;
@@ -33,12 +32,13 @@ static void usage(const char *prog) {
         "  -r, --reference FILE    input FASTQ/FA \n"
         "  -o, --output FILE       output CSV (default: counts.csv)\n"
         "  -s, --sam FILE          output SAM alignments (use \"-\" for stdout)\n"
-        "  -k, --kmer INT          k-mer length (default: 10)\n"
+        "  -k, --kmer INT          seed k-mer length for prefilter [1..12] (default: 8)\n"
+        "      --seed-mm INT       allowed seed mismatches [0|1] (default: 0)\n"
         "      --no-rc             Disable Reverse Complement (default off)\n"
         "      --indels            Include Indels (default off) (Currently Not Supported)\n"
         "  -m, --mismatch INT      Number of mismatches allowed [0] (Max 5 MMs allowed)\n"
         "  -d, --dup-policy MODE   duplicate handling: error|warn|ignore [error]\n"
-        "  -t, --threads UINT      Number of threads [4] (Currently Not Supported)\n"
+        "  -t, --threads UINT      Number of worker threads [1]\n"
         "  -v                      Print Debugging Log Messages\n"
         "  -h, --help              show this help\n",
         prog);
@@ -59,6 +59,7 @@ int parse_args(int argc, char **argv, Options *opt, int *pos_start) {
         {"output",    ko_required_argument, 'o'},
         {"sam",       ko_required_argument, 's'},
         {"kmer",      ko_required_argument, 'k'},
+        {"seed-mm",   ko_required_argument, 302},
         {"dup-policy",ko_required_argument, 'd'},
         {"no-rc",     ko_no_argument      , 301},
         {"threads",   ko_required_argument, 't'},
@@ -72,7 +73,8 @@ int parse_args(int argc, char **argv, Options *opt, int *pos_start) {
     opt->ref = "";
     opt->out = "counts.csv";
     opt->sam = NULL;
-    opt->k = 10;
+    opt->k = 8;
+    opt->seed_mm = 0;
     opt->rc = 1;
     opt->verbose = 0;
     opt->threads = 1;
@@ -88,13 +90,24 @@ int parse_args(int argc, char **argv, Options *opt, int *pos_start) {
         case 'o': opt->out = o.arg; break;
         case 's': opt->sam = o.arg; break;
         case 'k': opt->k = atoi(o.arg); break;
+        case 302:
+            opt->seed_mm = atoi(o.arg);
+            if (opt->seed_mm < 0 || opt->seed_mm > 1) {
+                fprintf(stderr, "Invalid --seed-mm '%s'. Use: 0 or 1\n", o.arg);
+                return -6;
+            }
+            break;
         case 'd':
             if (parse_dup_policy(o.arg, &opt->dup_policy) != 0) {
                 fprintf(stderr, "Invalid --dup-policy '%s'. Use: error|warn|ignore\n", o.arg);
                 return -5;
             }
             break;
-        case 't': opt->threads = atoi(o.arg); break;
+        case 't': {
+            int t = atoi(o.arg);
+            opt->threads = (t > 0) ? (unsigned)t : 1u;
+            break;
+        }
         case 'm': 
             opt->mm = atoi(o.arg); 
             if (opt->mm < 0) opt->mm = 0;
@@ -113,9 +126,10 @@ int parse_args(int argc, char **argv, Options *opt, int *pos_start) {
     }
 
     *pos_start = o.ind; // first positional argument (if any)
-    if (opt->k <= 0 || opt->k > 20) {
-        fprintf(stderr, "Invalid kmer len\n"); usage(argv[0]); return -4;
+    if (opt->k <= 0 || opt->k > 12) {
+        fprintf(stderr, "Invalid k-mer seed length. Allowed range: 1..12\n"); usage(argv[0]); return -4;
     }
+    if (opt->threads == 0) opt->threads = 1;
     return 0;
 }
 
@@ -133,10 +147,12 @@ int load_fastq(const char *path,
                TrieNode *root, 
                kh_counter_t *counts,
                int kmerlen, 
+               int seed_mm,
                size_t *min_out, 
                size_t *max_out, 
                int k_mm,
-               FILE *sam_fp);
+               FILE *sam_fp,
+               unsigned threads);
 
 
 int main(int argc, char **argv) {
@@ -176,11 +192,14 @@ int main(int argc, char **argv) {
             trie_free_node(root);
             return 1;
         }
+        if (sam_fp != stdout) {
+            setvbuf(sam_fp, NULL, _IOFBF, 8 * 1024 * 1024);
+        }
         trie_write_sam_header(sam_fp, root);
     }
 
     // Find Reference in Queries
-    if (load_fastq(opt.in, root, map, opt.k, &min_len, &max_len, opt.mm, sam_fp) != 0) {
+    if (load_fastq(opt.in, root, map, opt.k, opt.seed_mm, &min_len, &max_len, opt.mm, sam_fp, opt.threads) != 0) {
         fprintf(stderr, "Failed while loading input reads.\n");
         if (sam_fp && sam_fp != stdout) fclose(sam_fp);
         counter_free(map);

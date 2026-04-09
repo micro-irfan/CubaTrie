@@ -5,12 +5,6 @@
 #include "kmer.h"
 #include "utils.h"
 
-// Trie API
-typedef struct TrieNode TrieNode;
-bool trie_prefix_search(const TrieNode *root,
-                        const uint64_t *b2, 
-                        size_t n);
-
 // comparator for qsort (ascending)
 static int cmp_u32_asc(const void *a, const void *b) {
     uint32_t x = *(const uint32_t*)a, y = *(const uint32_t*)b;
@@ -45,6 +39,23 @@ typedef struct {
     size_t match_len;
     int nm;
 } SamAlignmentRecord;
+
+struct TrieCursorState {
+    const TrieNode *node;
+    uint8_t edge_idx;
+    uint16_t edge_off;
+};
+
+#define CURSOR_AT_NODE 255u
+
+typedef struct {
+    const char *name;
+    const char *seq;
+    size_t seq_len;
+    int mm;
+} CursorMatch;
+
+typedef kvec_t(CursorMatch) CursorMatchVec;
 
 static void sam_write_alignment(FILE *sam_fp,
                                 const char *read_name,
@@ -123,81 +134,349 @@ static inline int encode_kmer(const char *s, size_t n, uint64_t *out) {
     return 0;
 }
 
-static inline void kset64_insert(khash_t(kset64) *set, uint64_t code) {
-    int ret = 0;
-    khiter_t it = kh_put(kset64, set, (khint64_t)code, &ret);
-    if (ret > 0) kh_key(set, it) = (khint64_t)code;
+static inline void bitset_set(KmerBitset *index, uint64_t code) {
+    if (!index || !index->words) return;
+    if (code >= index->nbits) return;
+    index->words[code >> 6] |= (uint64_t)1u << (code & 63u);
 }
 
-static void kmer_set_add_sequence(khash_t(kset64) *out, const char *seq, size_t seq_len, size_t k) {
-    if (!out || !seq || k == 0 || seq_len < k) return;
-    uint64_t code = 0;
-    if (encode_kmer(seq, k, &code) == 0) {
-        kset64_insert(out, code);
+int kmer_bitset_test(const KmerBitset *index, uint64_t code) {
+    if (!index || !index->words) return 0;
+    if (code >= index->nbits) return 0;
+    return (index->words[code >> 6] & ((uint64_t)1u << (code & 63u))) != 0;
+}
+
+static int kmer_index_add_state(KmerBitset *index,
+                                const TrieNode *node,
+                                uint8_t edge_idx,
+                                uint16_t edge_off) {
+    if (!index || !node) return -1;
+    if (index->nstates == index->mstates) {
+        size_t nm = index->mstates ? (index->mstates << 1) : 1024;
+        TrieCursorState *p = (TrieCursorState*)realloc(index->states, nm * sizeof(*p));
+        if (!p) return -1;
+        index->states = p;
+        index->mstates = nm;
     }
+    index->states[index->nstates].node = node;
+    index->states[index->nstates].edge_idx = edge_idx;
+    index->states[index->nstates].edge_off = edge_off;
+    return (int)index->nstates++;
 }
 
-static void trie_collect_terminal_kmers(const TrieNode *node, size_t k, khash_t(kset64) *out) {
-    if (!node) return;
+static int trie_collect_seed_states_rec(const TrieNode *node,
+                                        size_t depth,
+                                        uint64_t code,
+                                        size_t k,
+                                        KmerBitset *index) {
+    if (!node) return 0;
 
-    if (node->end && node->seq && node->seq_len >= k) {
-        kmer_set_add_sequence(out, node->seq, node->seq_len, k);
+    if (depth == k) {
+        int sid = kmer_index_add_state(index, node, CURSOR_AT_NODE, 0);
+        if (sid < 0) return -1;
+        index->state_idx[code] = sid;
+        bitset_set(index, code);
+        return 0;
     }
 
-    for (int i = 0; i < ALPHABET_SIZE; ++i) {
-        trie_collect_terminal_kmers(node->child[i], k, out);
+    for (int idx = 0; idx < ALPHABET_SIZE; ++idx) {
+        const char *label = node->edge_label[idx];
+        const TrieNode *child = node->child[idx];
+        if (!label || !child) continue;
+
+        size_t lablen = strlen(label);
+        size_t d = depth;
+        uint64_t code2 = code;
+
+        for (size_t j = 0; j < lablen && d < k; ++j) {
+            int b = nt2bits(label[j]);
+            if (b < 0) return -1;
+            code2 = (code2 << 2) | (uint64_t)b;
+            ++d;
+            if (d == k) {
+                int sid = -1;
+                if (j + 1 == lablen) {
+                    sid = kmer_index_add_state(index, child, CURSOR_AT_NODE, 0);
+                } else {
+                    sid = kmer_index_add_state(index, node, (uint8_t)idx, (uint16_t)(j + 1));
+                }
+                if (sid < 0) return -1;
+                index->state_idx[code2] = sid;
+                bitset_set(index, code2);
+            }
+        }
+
+        if (depth + lablen < k) {
+            if (trie_collect_seed_states_rec(child, depth + lablen, code2, k, index) != 0) return -1;
+        }
     }
+    return 0;
 }
 
-khash_t(kset64) *kmer_set_from_trie(const TrieNode *root, size_t k) {
-    khash_t(kset64) *out = kh_init(kset64);
-    if (!out || !root || k == 0) return out;
+KmerBitset *kmer_bitset_from_trie(const TrieNode *root, size_t k) {
+    if (!root || k == 0 || k > 31) return NULL;
 
-    trie_collect_terminal_kmers(root, k, out);
-    return out;
+    KmerBitset *index = (KmerBitset*)calloc(1, sizeof(*index));
+    if (!index) return NULL;
+    index->k = k;
+    index->nbits = (size_t)1ull << (2u * k);
+    index->nwords = (index->nbits + 63u) >> 6;
+    index->words = (uint64_t*)calloc(index->nwords, sizeof(uint64_t));
+    if (!index->words) {
+        free(index);
+        return NULL;
+    }
+    index->state_idx = (int32_t*)malloc(index->nbits * sizeof(int32_t));
+    if (!index->state_idx) {
+        free(index->words);
+        free(index);
+        return NULL;
+    }
+    for (size_t i = 0; i < index->nbits; ++i) index->state_idx[i] = -1;
+
+    if (trie_collect_seed_states_rec(root, 0, 0, k, index) != 0) {
+        free(index->state_idx);
+        free(index->states);
+        free(index->words);
+        free(index);
+        return NULL;
+    }
+    return index;
 }
 
+void kmer_bitset_destroy(KmerBitset *index) {
+    if (!index) return;
+    free(index->states);
+    free(index->state_idx);
+    free(index->words);
+    free(index);
+}
 
-void find_kmer(const char *s, const size_t s_len, 
-               const TrieNode *trie,
-               khash_t(kset64) *kmer_hits,
-               khash_t(kset64) *kmer_search,
-               size_t k,
-               u32vec_t *hits) {
+static int seed_match_with_mm(const KmerBitset *index, uint64_t code, int seed_mm) {
+    size_t k = index ? index->k : 0;
+    if (!index || k == 0) return 0;
+    if (kmer_bitset_test(index, code)) return 1;
+    if (seed_mm <= 0) return 0;
 
-    if (!s || k <= 0 || (size_t)k > s_len) return;                    
-    int has_precomputed_kmers = (kmer_hits && kh_size(kmer_hits) > 0);
+    for (size_t pos = 0; pos < k; ++pos) {
+        size_t shift = 2u * (k - 1u - pos);
+        uint64_t orig = (code >> shift) & 3u;
+        uint64_t cleared = code & ~((uint64_t)3u << shift);
+        for (uint64_t alt = 0; alt < 4u; ++alt) {
+            if (alt == orig) continue;
+            uint64_t neighbor = cleared | (alt << shift);
+            if (kmer_bitset_test(index, neighbor)) return 1;
+        }
+    }
+    return 0;
+}
 
-    for (size_t i = 0; i + (size_t)k <= s_len; ++i) {
+void find_kmer_bitset(const char *s,
+                      size_t s_len,
+                      const KmerBitset *index,
+                      int seed_mm,
+                      u32vec_t *hits) {
+    if (!s || !index || index->k == 0 || index->k > s_len) return;
+    if (seed_mm < 0) seed_mm = 0;
+    if (seed_mm > 1) seed_mm = 1;
+
+    for (size_t i = 0; i + index->k <= s_len; ++i) {
         uint64_t code;
-        if (encode_kmer(s + i, k, &code) < 0) continue;
-
-        // if Kmer in kmer_hit; add pos to check; else continue
-        if (has_precomputed_kmers) {
-            if (kh_get(kset64, kmer_hits, (khint64_t)code) != kh_end(kmer_hits)) {
-                kv_push(uint32_t, 0, *hits, i);
-            } 
-            continue;
-        }
-        
-        // fallback path: no precomputed set, use kmer_search as searched cache
-        // if kmer in searched cache; continue
-        if (kh_get(kset64, kmer_search, (khint64_t)code) != kh_end(kmer_search)) {
-            continue;
-        }
-
-        // if Kmer not in kmer_hit; add pos to check; add kmer to kmer_hit
-        if (trie && trie_prefix_search(trie, &code, k)) {
+        if (encode_kmer(s + i, index->k, &code) < 0) continue;
+        if (seed_match_with_mm(index, code, seed_mm)) {
             kv_push(uint32_t, 0, *hits, i);
-            kset64_insert(kmer_hits, code);
         }
-
-        if (kmer_search) kset64_insert(kmer_search, code);
     }
 
     if (hits->n > 1) qsort(hits->a, hits->n, sizeof(uint32_t), cmp_u32_asc);
-    
-    return;
+}
+
+static void cursor_collect_matches_from_state(const KmerBitset *index,
+                                              int state_id,
+                                              const char *sequence,
+                                              size_t seq_len,
+                                              size_t start,
+                                              uint32_t min_len,
+                                              uint32_t max_len,
+                                              int mm_initial,
+                                              int k_mm,
+                                              CursorMatchVec *out) {
+    if (!index || !sequence || !out) return;
+    if (state_id < 0 || (size_t)state_id >= index->nstates) return;
+    if (start + index->k > seq_len) return;
+    if (mm_initial > k_mm) return;
+
+    const TrieCursorState *st = &index->states[state_id];
+    const TrieNode *node = st->node;
+    uint8_t edge_idx = st->edge_idx;
+    uint16_t edge_off = st->edge_off;
+    size_t p = start + index->k;
+    size_t consumed = index->k;
+    int mm_used = mm_initial;
+
+    for (;;) {
+        if (edge_idx == CURSOR_AT_NODE) {
+            if (node->end && consumed >= min_len && consumed <= max_len) {
+                CursorMatch cm = { node->name, node->seq, node->seq_len, mm_used };
+                kv_push(CursorMatch, 0, *out, cm);
+            }
+
+            if (consumed >= max_len || p >= seq_len) break;
+            int idx = nt2bits(sequence[p]);
+            if (idx < 0) break;
+            if (!node->edge_label[idx] || !node->child[idx]) break;
+            edge_idx = (uint8_t)idx;
+            edge_off = 0;
+        }
+
+        const char *label = node->edge_label[edge_idx];
+        const TrieNode *child = node->child[edge_idx];
+        if (!label || !child) break;
+
+        size_t lablen = strlen(label);
+        size_t j = edge_off;
+        while (j < lablen && consumed < max_len && p < seq_len) {
+            if (sequence[p] != label[j]) {
+                if (++mm_used > k_mm) return;
+            }
+            ++p;
+            ++consumed;
+            ++j;
+        }
+
+        if (j < lablen) break; // ran out of room in this read slice
+        node = child;
+        edge_idx = CURSOR_AT_NODE;
+        edge_off = 0;
+    }
+}
+
+void find_matches_seeded(const char *sequence, size_t seq_len,
+                         const u32vec_t *hit,
+                         uint32_t min_len, uint32_t max_len,
+                         const TrieNode *trie,
+                         const KmerBitset *seed_index,
+                         int seed_mm,
+                         khash_t(strset) *found_sequences,
+                         int k_mm,
+                         const char *read_name,
+                         const char *read_qual,
+                         FILE *sam_fp) {
+    (void)trie;
+    if (!sequence || !hit || !seed_index || !found_sequences) return;
+    if (seed_mm < 0) seed_mm = 0;
+    if (seed_mm > 1) seed_mm = 1;
+
+    khash_t(posset) *start_pos_cache = kh_init(posset); // dedupe absolute start positions
+    CursorMatchVec matches; kv_init(matches);
+    kvec_t(SamAlignmentRecord) sam_records; kv_init(sam_records);
+
+    for (size_t idx = 0; idx < hit->n; ++idx) {
+        uint32_t h = hit->a[idx];
+
+        if ((size_t)h + (size_t)min_len > seq_len) continue;
+        if ((size_t)h + (size_t)max_len > seq_len) continue;
+
+        uint64_t code = 0;
+        if (encode_kmer(sequence + h, seed_index->k, &code) < 0) continue;
+
+        int matched_this_start = 0;
+        int exact_sid = seed_index->state_idx[code];
+
+        // exact seed first
+        if (exact_sid >= 0) {
+            matches.n = 0;
+            cursor_collect_matches_from_state(seed_index, exact_sid, sequence, seq_len, h,
+                                              min_len, max_len, 0, k_mm, &matches);
+            for (size_t m = 0; m < matches.n; ++m) {
+                khiter_t it = kh_get(posset, start_pos_cache, (khint_t)h);
+                if (it != kh_end(start_pos_cache)) { matched_this_start = 1; break; }
+
+                int ret = 0;
+                it = kh_put(posset, start_pos_cache, (khint_t)h, &ret);
+                (void)ret;
+
+                khiter_t jt = kh_put(strset, found_sequences, (char*)matches.a[m].name, &ret);
+                if (ret > 0) kh_key(found_sequences, jt) = strdup(matches.a[m].name);
+
+                if (sam_fp) {
+                    SamAlignmentRecord rec = {
+                        kh_key(found_sequences, jt),
+                        h,
+                        matches.a[m].seq_len,
+                        matches.a[m].mm
+                    };
+                    kv_push(SamAlignmentRecord, 0, sam_records, rec);
+                }
+                matched_this_start = 1;
+                break; // preserve existing one-hit-per-start behavior
+            }
+        }
+
+        if (matched_this_start || seed_mm == 0) continue;
+
+        // Hamming-1 seed neighbors
+        for (size_t pos = 0; pos < seed_index->k && !matched_this_start; ++pos) {
+            size_t shift = 2u * (seed_index->k - 1u - pos);
+            uint64_t orig = (code >> shift) & 3u;
+            uint64_t cleared = code & ~((uint64_t)3u << shift);
+            for (uint64_t alt = 0; alt < 4u && !matched_this_start; ++alt) {
+                if (alt == orig) continue;
+                uint64_t neighbor = cleared | (alt << shift);
+                int sid = seed_index->state_idx[neighbor];
+                if (sid < 0) continue;
+
+                matches.n = 0;
+                cursor_collect_matches_from_state(seed_index, sid, sequence, seq_len, h,
+                                                  min_len, max_len, 1, k_mm, &matches);
+                for (size_t m = 0; m < matches.n; ++m) {
+                    khiter_t it = kh_get(posset, start_pos_cache, (khint_t)h);
+                    if (it != kh_end(start_pos_cache)) { matched_this_start = 1; break; }
+
+                    int ret = 0;
+                    it = kh_put(posset, start_pos_cache, (khint_t)h, &ret);
+                    (void)ret;
+
+                    khiter_t jt = kh_put(strset, found_sequences, (char*)matches.a[m].name, &ret);
+                    if (ret > 0) kh_key(found_sequences, jt) = strdup(matches.a[m].name);
+
+                    if (sam_fp) {
+                        SamAlignmentRecord rec = {
+                            kh_key(found_sequences, jt),
+                            h,
+                            matches.a[m].seq_len,
+                            matches.a[m].mm
+                        };
+                        kv_push(SamAlignmentRecord, 0, sam_records, rec);
+                    }
+                    matched_this_start = 1;
+                    break; // preserve existing one-hit-per-start behavior
+                }
+            }
+        }
+    }
+
+    if (sam_fp && sam_records.n > 0) {
+        int nh = (int)sam_records.n;
+        flockfile(sam_fp);
+        for (size_t i = 0; i < sam_records.n; ++i) {
+            sam_write_alignment(sam_fp,
+                                read_name,
+                                sequence,
+                                read_qual,
+                                seq_len,
+                                sam_records.a[i].ref_name,
+                                sam_records.a[i].match_start,
+                                sam_records.a[i].match_len,
+                                sam_records.a[i].nm,
+                                nh);
+        }
+        funlockfile(sam_fp);
+    }
+
+    kv_destroy(matches);
+    kv_destroy(sam_records);
+    kh_destroy(posset, start_pos_cache);
 }
 
 
@@ -293,6 +572,7 @@ void find_matches(const char *sequence, size_t seq_len,
 
     if (sam_fp && sam_records.n > 0) {
         int nh = (int)sam_records.n;
+        flockfile(sam_fp);
         for (size_t i = 0; i < sam_records.n; ++i) {
             sam_write_alignment(sam_fp,
                                 read_name,
@@ -305,6 +585,7 @@ void find_matches(const char *sequence, size_t seq_len,
                                 sam_records.a[i].nm,
                                 nh);
         }
+        funlockfile(sam_fp);
     }
 
     kv_destroy(sam_records);
