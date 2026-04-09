@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * Allow Mismatches For trie_search_exact func (Mismatches for Prefix Search Disallowed).
 * Option to Output a SAM File. NM and NH tags are included.
 * Added an option to ignore reverse complementary sequences in short sequence reference.
-* Added /tests  
+* Added unit test to /tests  
 
 ## [v0.0.1]
 * Initial release of cuba trie - beta version, only exact match, and unoptimized
