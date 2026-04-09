@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * Added direct-access seed-to-trie cursor table for continuation from seed depth.
 * Improved SAM write performance in multithreaded mode using a dedicated writer queue.
 * Increased SAM output buffering (`setvbuf`) to reduce flush overhead.
+* Switched multithreaded read task queue to batched enqueue/dequeue to reduce lock contention.
 * Reduced multithreaded no-SAM overhead by skipping per-read `qname/qual` copies.
 
 ## [v0.0.2]

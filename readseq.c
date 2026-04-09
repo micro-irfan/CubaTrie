@@ -27,7 +27,9 @@ static char *revcomp_new_n(const char *s, size_t n) {
 }
 
 const size_t STEP = 1000000;
-static const size_t MT_QUEUE_CAPACITY = 16384;
+static const size_t MT_TASK_QUEUE_CAPACITY = 1024;
+static const size_t MT_SAM_QUEUE_CAPACITY = 16384;
+static const size_t MT_READ_BATCH_SIZE = 256;
 
 static size_t qname_len_no_rc(const char *name) {
     if (!name) return 0;
@@ -67,7 +69,12 @@ typedef struct {
 } FastqTask;
 
 typedef struct {
-    FastqTask *buf;
+    FastqTask *tasks;
+    size_t n;
+} FastqBatch;
+
+typedef struct {
+    FastqBatch *buf;
     size_t cap;
     size_t head;
     size_t tail;
@@ -138,6 +145,16 @@ static void free_fastq_task(FastqTask *task) {
     task->seq = NULL;
     task->qual = NULL;
     task->len = 0;
+}
+
+static void free_fastq_batch(FastqBatch *batch) {
+    if (!batch || !batch->tasks) return;
+    for (size_t i = 0; i < batch->n; ++i) {
+        free_fastq_task(&batch->tasks[i]);
+    }
+    free(batch->tasks);
+    batch->tasks = NULL;
+    batch->n = 0;
 }
 
 static void free_sam_chunk(SamChunk *chunk) {
@@ -488,7 +505,7 @@ static void fastq_queue_finish(FastqTaskQueue *q) {
 }
 
 // Returns 0 on success, -1 on abort.
-static int fastq_queue_push(FastqTaskQueue *q, FastqTask *task) {
+static int fastq_queue_push(FastqTaskQueue *q, FastqBatch *batch) {
     pthread_mutex_lock(&q->mtx);
     while (q->size == q->cap && !q->aborted) {
         pthread_cond_wait(&q->not_full, &q->mtx);
@@ -498,7 +515,7 @@ static int fastq_queue_push(FastqTaskQueue *q, FastqTask *task) {
         return -1;
     }
 
-    q->buf[q->tail] = *task;
+    q->buf[q->tail] = *batch;
     q->tail = (q->tail + 1) % q->cap;
     q->size++;
     pthread_cond_signal(&q->not_empty);
@@ -507,7 +524,7 @@ static int fastq_queue_push(FastqTaskQueue *q, FastqTask *task) {
 }
 
 // Returns 0 on success, 1 on completion, -1 on abort.
-static int fastq_queue_pop(FastqTaskQueue *q, FastqTask *task_out) {
+static int fastq_queue_pop(FastqTaskQueue *q, FastqBatch *batch_out) {
     pthread_mutex_lock(&q->mtx);
     while (q->size == 0 && !q->done && !q->aborted) {
         pthread_cond_wait(&q->not_empty, &q->mtx);
@@ -523,7 +540,7 @@ static int fastq_queue_pop(FastqTaskQueue *q, FastqTask *task_out) {
         return 1;
     }
 
-    *task_out = q->buf[q->head];
+    *batch_out = q->buf[q->head];
     memset(&q->buf[q->head], 0, sizeof(q->buf[q->head]));
     q->head = (q->head + 1) % q->cap;
     q->size--;
@@ -536,7 +553,7 @@ static void fastq_queue_destroy(FastqTaskQueue *q) {
     if (!q) return;
     for (size_t i = 0; i < q->size; ++i) {
         size_t idx = (q->head + i) % q->cap;
-        free_fastq_task(&q->buf[idx]);
+        free_fastq_batch(&q->buf[idx]);
     }
     free(q->buf);
     pthread_cond_destroy(&q->not_empty);
@@ -555,33 +572,38 @@ static void *fastq_worker_main(void *arg) {
     }
 
     for (;;) {
-        FastqTask task = {0};
-        int pop_status = fastq_queue_pop(ctx->queue, &task);
+        FastqBatch batch = {0};
+        int pop_status = fastq_queue_pop(ctx->queue, &batch);
         if (pop_status == 1) break;
         if (pop_status < 0) break;
 
-        if (process_one_read(task.name,
-                             task.seq,
-                             task.qual,
-                             task.len,
-                             ctx->root,
-                             ctx->local_counts,
-                             ctx->seed_index,
-                             ctx->seed_mm,
-                             ctx->min_len,
-                             ctx->max_len,
-                             ctx->k_mm,
-                             ctx->sam_fp,
-                             ctx->sam_queue,
-                             0) != 0) {
-            ctx->status = 1;
-            free_fastq_task(&task);
-            fastq_queue_request_abort(ctx->queue);
-            if (ctx->sam_queue) sam_chunk_queue_request_abort(ctx->sam_queue);
-            break;
+        for (size_t i = 0; i < batch.n; ++i) {
+            FastqTask *task = &batch.tasks[i];
+            if (process_one_read(task->name,
+                                 task->seq,
+                                 task->qual,
+                                 task->len,
+                                 ctx->root,
+                                 ctx->local_counts,
+                                 ctx->seed_index,
+                                 ctx->seed_mm,
+                                 ctx->min_len,
+                                 ctx->max_len,
+                                 ctx->k_mm,
+                                 ctx->sam_fp,
+                                 ctx->sam_queue,
+                                 0) != 0) {
+                ctx->status = 1;
+                fastq_queue_request_abort(ctx->queue);
+                if (ctx->sam_queue) sam_chunk_queue_request_abort(ctx->sam_queue);
+                break;
+            }
         }
 
-        free_fastq_task(&task);
+        free_fastq_batch(&batch);
+        if (ctx->status != 0) {
+            break;
+        }
     }
     return NULL;
 }
@@ -670,7 +692,7 @@ static int load_fastq_mt(const char *path,
     if (!ks) { gzclose(fp); return 1; }
 
     FastqTaskQueue queue;
-    if (fastq_queue_init(&queue, MT_QUEUE_CAPACITY) != 0) {
+    if (fastq_queue_init(&queue, MT_TASK_QUEUE_CAPACITY) != 0) {
         kseq_destroy(ks);
         gzclose(fp);
         return 1;
@@ -685,7 +707,7 @@ static int load_fastq_mt(const char *path,
     }
 
     if (use_sam_writer) {
-        if (sam_chunk_queue_init(&sam_queue, MT_QUEUE_CAPACITY) != 0) {
+        if (sam_chunk_queue_init(&sam_queue, MT_SAM_QUEUE_CAPACITY) != 0) {
             kmer_bitset_destroy(seed_index);
             fastq_queue_destroy(&queue);
             kseq_destroy(ks);
@@ -750,6 +772,13 @@ static int load_fastq_mt(const char *path,
 
     size_t nreads = 0;
     int l = 0;
+    FastqBatch pending = {0};
+    pending.tasks = (FastqTask*)calloc(MT_READ_BATCH_SIZE, sizeof(*pending.tasks));
+    if (!pending.tasks) {
+        status = 1;
+        fastq_queue_request_abort(&queue);
+        if (use_sam_writer) sam_chunk_queue_request_abort(&sam_queue);
+    }
     if (status == 0) {
         while ((l = kseq_read(ks)) >= 0) {
             FastqTask task = {0};
@@ -768,11 +797,26 @@ static int load_fastq_mt(const char *path,
                 break;
             }
 
-            if (fastq_queue_push(&queue, &task) != 0) {
-                free_fastq_task(&task);
-                status = 1;
-                if (use_sam_writer) sam_chunk_queue_request_abort(&sam_queue);
-                break;
+            pending.tasks[pending.n++] = task;
+            if (pending.n == MT_READ_BATCH_SIZE) {
+                FastqBatch out = pending;
+                if (fastq_queue_push(&queue, &out) != 0) {
+                    free_fastq_batch(&out);
+                    status = 1;
+                    fastq_queue_request_abort(&queue);
+                    if (use_sam_writer) sam_chunk_queue_request_abort(&sam_queue);
+                    pending.tasks = NULL;
+                    pending.n = 0;
+                    break;
+                }
+                pending.tasks = (FastqTask*)calloc(MT_READ_BATCH_SIZE, sizeof(*pending.tasks));
+                pending.n = 0;
+                if (!pending.tasks) {
+                    status = 1;
+                    fastq_queue_request_abort(&queue);
+                    if (use_sam_writer) sam_chunk_queue_request_abort(&sam_queue);
+                    break;
+                }
             }
 
             if (++nreads % STEP == 0) {
@@ -781,6 +825,21 @@ static int load_fastq_mt(const char *path,
             }
         }
         if (l < -1) status = 1;
+    }
+
+    if (pending.tasks) {
+        if (status == 0 && pending.n > 0) {
+            FastqBatch out = pending;
+            if (fastq_queue_push(&queue, &out) != 0) {
+                free_fastq_batch(&out);
+                status = 1;
+                fastq_queue_request_abort(&queue);
+                if (use_sam_writer) sam_chunk_queue_request_abort(&sam_queue);
+            }
+            pending.tasks = NULL;
+            pending.n = 0;
+        }
+        free_fastq_batch(&pending);
     }
 
     fastq_queue_finish(&queue);
