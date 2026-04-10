@@ -1,21 +1,52 @@
-# CubaTrie
+# cubaTrie
 
-Short Reference Mapper employing Radix Trie Structure For Querying Reads or Larger Sequences. Cuba means try in the Malay Language. Essentially its Try Try* - a personal stab at writing a tool in C.
+cubaTrie is a Short Reference (20-30bp) Mapper employing Radix Trie Structure For Querying generic Longer Reads (>50bp) or Larger Sequences like viral sequences to find conserved target sequences. Cuba (pronounced as Chew-bah and not the country Q-ba) means to try in the Malay Language. Essentially, the tool means Try Try*.
 
 ## Getting Started
 
 ```sh
-git clone https://github.com/micro_irfan/cuba_trie
-cd cuba_trie && make
+git clone https://github.com/micro_irfan/CubaTrie
+cd CubaTrie && make 
 
 # Short references against merged paired data (using fastp)
-./cuba_trie -r reference.fasta -i merged.fastq.gz -o counts.csv
+./cubaTrie -r reference.fasta -i merged.fastq.gz -o counts.csv
+```
+
+## Suggested Workflows For Paired-End Data
+
+Users can run dedup and merge paired-end data before running cubaTrie
+
+```sh
+# Run Deduplication Step (If Required) with Fastp
+fastp \
+    --in1 ${read1} \
+    --in2 ${read2} \
+    --out1 ${sample_id}_R1.trimmed.fastq.gz \
+    --out2 ${sample_id}_R2.trimmed.fastq.gz \
+    --json ${sample_id}_fastp.dedup.json \
+    --html ${sample_id}_fastp.dedup.html \
+    --dedup \
+    --thread 8
+
+# Run Merge Step with Fastp
+fastp \
+    --in1 ${sample_id}_R1.trimmed.fastq.gz \
+    --in2 ${sample_id}_R2.trimmed.fastq.gz \
+    --merge \
+    --merged_out ${sample_id}.merged.fastq.gz \
+    --out1 ${sample_id}_R1.merged.fastq.gz \
+    --out2 ${sample_id}_R2.merged.fastq.gz \
+    --json ${sample_id}_fastp.merge.json \
+    --html ${sample_id}_fastp.merge.html \
+    --thread 8
+
+./cubaTrie -r ref.fa -i ${sample_id}.merged.fastq.gz -o ${sample_id}.counts.csv -k 8 -m 1 -t 8
 ```
 
 ## CLI Options
 
 ```text
-./cuba_trie [options]
+./cubaTrie [options]
 ```
 
 | Option | Description | Default |
@@ -37,13 +68,13 @@ cd cuba_trie && make
 
 ```sh
 # Basic run
-./cuba_trie -r reference.fasta -i reads.fastq.gz -o counts.csv
+./cubaTrie -r reference.fasta -i reads.fastq.gz -o counts.csv
 
 # With SAM output and multithreading
-./cuba_trie -r reference.fasta -i reads.fastq.gz -o counts.csv -s output.sam -t 8
+./cubaTrie -r reference.fasta -i reads.fastq.gz -o counts.csv -s output.sam -t 8
 
 # More sensitive seeding (allow 1 mismatch in seed and query)
-./cuba_trie -r reference.fasta -i reads.fastq.gz -k 8 --seed-mm 1 -m 1 -o counts.csv
+./cubaTrie -r reference.fasta -i reads.fastq.gz -k 8 --seed-mm 1 -m 1 -o counts.csv
 
 ```
 

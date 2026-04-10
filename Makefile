@@ -5,7 +5,7 @@
 #   make clean
 
 # ---- project ----
-TARGET := cuba_trie
+TARGET := cubaTrie
 SRCS   := kalloc.c utils.c trie.c kmer.c readseq.c main.c 
 OBJS   := $(SRCS:.c=.o)
 DEPS   := $(OBJS:.o=.d)

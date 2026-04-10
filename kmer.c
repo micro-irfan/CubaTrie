@@ -26,13 +26,6 @@ static int name_is_rev(const char *name) {
     return (n >= 3 && name[n-3] == '/' && name[n-2] == 'r' && name[n-1] == 'c');
 }
 
-static size_t qname_len_no_rc(const char *name) {
-    if (!name) return 0;
-    size_t n = strlen(name);
-    if (n >= 3 && name[n-3] == '/' && name[n-2] == 'r' && name[n-1] == 'c') return n - 3;
-    return n;
-}
-
 typedef struct {
     const char *ref_name;
     size_t match_start;
@@ -88,8 +81,8 @@ static void sam_write_alignment(FILE *sam_fp,
 
     int flag = name_is_rev(ref_name) ? 16 : 0;
     int has_full_qual = (read_qual && strlen(read_qual) == read_len);
-    size_t qname_len = qname_len_no_rc(read_name);
-    size_t rname_len = qname_len_no_rc(ref_name);
+    size_t qname_len = name_len_no_rc_suffix(read_name);
+    size_t rname_len = name_len_no_rc_suffix(ref_name);
 
     // For hard clipping, output only the aligned segment in SEQ/QUAL.
     if (has_full_qual) {
@@ -354,7 +347,6 @@ static void cursor_collect_matches_from_state(const KmerBitset *index,
 void find_matches_seeded(const char *sequence, size_t seq_len,
                          const u32vec_t *hit,
                          uint32_t min_len, uint32_t max_len,
-                         const TrieNode *trie,
                          const KmerBitset *seed_index,
                          int seed_mm,
                          khash_t(strset) *found_sequences,
@@ -362,7 +354,6 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
                          const char *read_name,
                          const char *read_qual,
                          FILE *sam_fp) {
-    (void)trie;
     if (!sequence || !hit || !seed_index || !found_sequences) return;
     if (seed_mm < 0) seed_mm = 0;
     if (seed_mm > 1) seed_mm = 1;
@@ -528,7 +519,7 @@ void find_matches(const char *sequence, size_t seq_len,
         clear_matches_keep_capacity(&matches);  // reuse buffer without leaking old strings
         
         char *slice = malloc(max_len + 1);
-        if (!slice) /* handle OOM */;
+        if (!slice) continue;
         memcpy(slice, sequence + h, max_len);
         slice[max_len] = '\0';
 
@@ -552,7 +543,7 @@ void find_matches(const char *sequence, size_t seq_len,
                                  (char*)matches.a[m].name, &ret);
 
             if (ret > 0) {
-                // insert; reuse pointer owned by trie (don’t free in this set)
+                // insert; reuse pointer owned by trie (don't free in this set)
                 kh_key(found_sequences, jt) = strdup(matches.a[m].name);
             }
 

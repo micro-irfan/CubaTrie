@@ -44,23 +44,32 @@ static char *dup_cstr(const char *s) {
     return p;
 }
 
-void counter_inc(kh_counter_t *m, const char *key) {
+int counter_add_with_init(kh_counter_t *m, const char *key, size_t add, size_t init_if_new) {
+    if (!m || !key) return -1;
     int ret;
     khiter_t k = kh_put(counter, m, key, &ret);
-    if (ret < 0) { perror("kh_put"); exit(1); }
+    if (ret < 0) return -1;
     if (ret == 0) {
-        // existed
-        kh_val(m, k)++;
-    } else {
-        // new slot — own a copy of the key
-        char *owned = dup_cstr(key);
-        if (!owned) { perror("malloc"); exit(1); }
-        kh_key(m, k) = owned;
-        kh_val(m, k) = 0;
+        kh_val(m, k) += add;
+        return 0;
     }
+
+    char *owned = dup_cstr(key);
+    if (!owned) {
+        kh_del(counter, m, k);
+        return -1;
+    }
+    kh_key(m, k) = owned;
+    kh_val(m, k) = init_if_new;
+    return 0;
 }
 
-
+void counter_inc(kh_counter_t *m, const char *key) {
+    if (counter_add_with_init(m, key, 1, 0) != 0) {
+        perror("counter_inc");
+        exit(1);
+    }
+}
 
 void counter_free(kh_counter_t *m) {
     if (!m) return;
@@ -83,7 +92,7 @@ static char *dup_base_no_rc(const char *s) {
     return out;
 }
 
-/* your comparator (if you don’t already have it) */
+/* your comparator (if you don't already have it) */
 static int cmp_count_desc_then_key_asc(const void *pa, const void *pb) {
     const counter_entry_t *a = (const counter_entry_t*)pa;
     const counter_entry_t *b = (const counter_entry_t*)pb;

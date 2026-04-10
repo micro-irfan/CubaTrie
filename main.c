@@ -5,11 +5,6 @@
 #include "utils.h"
 #include "ketopt.h"
 
-/*
-TODO: Allow For Mismatches
-TODO: Check For Anchors - if reverse complimentary is found
-*/
-
 typedef struct {
     const char *in;          // -i/--input
     const char *ref;   // -r/--reference
@@ -26,17 +21,17 @@ typedef struct {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s [options] <ref.fa>\n"
+        "Usage: %s [options]\n"
         "Options:\n"
         "  -i, --input FILE        input FASTQ/FA \n"
-        "  -r, --reference FILE    input FASTQ/FA \n"
+        "  -r, --reference FILE    reference FASTA/FASTQ (required)\n"
         "  -o, --output FILE       output CSV (default: counts.csv)\n"
         "  -s, --sam FILE          output SAM alignments (use \"-\" for stdout)\n"
         "  -k, --kmer INT          seed k-mer length for prefilter [1..12] (default: 8)\n"
         "      --seed-mm INT       allowed seed mismatches [0|1] (default: 0)\n"
         "      --no-rc             Disable Reverse Complement (default off)\n"
         "      --indels            Include Indels (default off) (Currently Not Supported)\n"
-        "  -m, --mismatch INT      Number of mismatches allowed [0] (Max 5 MMs allowed)\n"
+        "  -m, --mismatch INT      Number of mismatches allowed [0..5] (default: --seed-mm)\n"
         "  -d, --dup-policy MODE   duplicate handling: error|warn|ignore [error]\n"
         "  -t, --threads UINT      Number of worker threads [1]\n"
         "  -v                      Print Debugging Log Messages\n"
@@ -82,6 +77,7 @@ int parse_args(int argc, char **argv, Options *opt, int *pos_start) {
     opt->dup_policy = TRIE_DUP_ERROR;
 
     ketopt_t o = KETOPT_INIT;
+    int mm_explicit = 0;
     int c;
     while ((c = ketopt(&o, argc, argv, 1, "i:r:o:s:k:t:m:d:vh", longopts)) >= 0) {
         switch (c) {
@@ -108,14 +104,15 @@ int parse_args(int argc, char **argv, Options *opt, int *pos_start) {
             opt->threads = (t > 0) ? (unsigned)t : 1u;
             break;
         }
-        case 'm': 
+        case 'm':
+            mm_explicit = 1;
             opt->mm = atoi(o.arg); 
             if (opt->mm < 0) opt->mm = 0;
             if (opt->mm > 5) opt->mm = 5;
             break;
         case 'v': opt->verbose++; break;
         case 301: opt->rc = 0; break;
-        case 'h': usage(argv[0]); return -1; // signal “showed help”
+        case 'h': usage(argv[0]); return -1; // signal "showed help"
         case '?': // unknown opt
             fprintf(stderr, "Unknown option: -%c\n", o.opt ? o.opt : '?');
             usage(argv[0]); return -2;
@@ -128,6 +125,16 @@ int parse_args(int argc, char **argv, Options *opt, int *pos_start) {
     *pos_start = o.ind; // first positional argument (if any)
     if (opt->k <= 0 || opt->k > 12) {
         fprintf(stderr, "Invalid k-mer seed length. Allowed range: 1..12\n"); usage(argv[0]); return -4;
+    }
+    if (!mm_explicit) {
+        // If -m/--mismatch is omitted, inherit seed mismatch allowance.
+        opt->mm = opt->seed_mm;
+    }
+    if (opt->seed_mm > opt->mm) {
+        fprintf(stderr,
+                "Invalid mismatch settings: --seed-mm=%d requires -m/--mismatch >= %d.\n",
+                opt->seed_mm, opt->seed_mm);
+        return -7;
     }
     if (opt->threads == 0) opt->threads = 1;
     return 0;
@@ -215,4 +222,3 @@ int main(int argc, char **argv) {
     trie_free_node(root);
     return 0;
 }
-

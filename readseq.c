@@ -29,14 +29,8 @@ static char *revcomp_new_n(const char *s, size_t n) {
 const size_t STEP = 1000000;
 static const size_t MT_TASK_QUEUE_CAPACITY = 1024;
 static const size_t MT_SAM_QUEUE_CAPACITY = 16384;
-static const size_t MT_READ_BATCH_SIZE = 256;
-
-static size_t qname_len_no_rc(const char *name) {
-    if (!name) return 0;
-    size_t n = strlen(name);
-    if (n >= 3 && name[n-3] == '/' && name[n-2] == 'r' && name[n-1] == 'c') return n - 3;
-    return n;
-}
+static const size_t MT_READ_BATCH_TARGET_BASES = 4u * 1024u * 1024u;
+static const size_t MT_READ_BATCH_MAX_READS = 4096;
 
 static void sam_write_unmapped(FILE *sam_fp,
                                const char *read_name,
@@ -45,7 +39,7 @@ static void sam_write_unmapped(FILE *sam_fp,
                                size_t read_len) {
     if (!sam_fp || !read_name || !read_seq) return;
     const char *qual = (read_qual && strlen(read_qual) == read_len) ? read_qual : "*";
-    size_t qname_len = qname_len_no_rc(read_name);
+    size_t qname_len = name_len_no_rc_suffix(read_name);
     fprintf(sam_fp, "%.*s\t4\t*\t0\t0\t*\t*\t0\t0\t%s\t%s\n",
             (int)qname_len, read_name, read_seq, qual);
 }
@@ -71,6 +65,7 @@ typedef struct {
 typedef struct {
     FastqTask *tasks;
     size_t n;
+    size_t bases;
 } FastqBatch;
 
 typedef struct {
@@ -113,7 +108,6 @@ typedef struct {
 typedef struct {
     FastqTaskQueue *queue;
     SamChunkQueue *sam_queue;
-    const TrieNode *root;
     const KmerBitset *seed_index;
     uint32_t min_len;
     uint32_t max_len;
@@ -130,10 +124,6 @@ static char *dup_cstr_n(const char *s, size_t n) {
     memcpy(p, s, n);
     p[n] = '\0';
     return p;
-}
-
-static char *dup_cstr(const char *s) {
-    return dup_cstr_n(s, strlen(s));
 }
 
 static void free_fastq_task(FastqTask *task) {
@@ -155,6 +145,7 @@ static void free_fastq_batch(FastqBatch *batch) {
     free(batch->tasks);
     batch->tasks = NULL;
     batch->n = 0;
+    batch->bases = 0;
 }
 
 static void free_sam_chunk(SamChunk *chunk) {
@@ -172,50 +163,12 @@ static void strset_free_with_keys(khash_t(strset) *set) {
     kh_destroy(strset, set);
 }
 
-static int counter_add_value(kh_counter_t *m, const char *key, size_t add) {
-    int ret = 0;
-    khiter_t it = kh_put(counter, m, key, &ret);
-    if (ret < 0) return -1;
-    if (ret == 0) {
-        kh_val(m, it) += add;
-        return 0;
-    }
-
-    char *owned = dup_cstr(key);
-    if (!owned) {
-        kh_del(counter, m, it);
-        return -1;
-    }
-
-    kh_key(m, it) = owned;
-    kh_val(m, it) = add;
-    return 0;
-}
-
 static int merge_counter_into(kh_counter_t *dst, const kh_counter_t *src) {
     for (khint_t i = kh_begin(src); i != kh_end(src); ++i) {
         if (!kh_exist(src, i)) continue;
-        if (counter_add_value(dst, kh_key(src, i), kh_val(src, i)) != 0) return -1;
+        size_t val = kh_val(src, i);
+        if (counter_add_with_init(dst, kh_key(src, i), val, val) != 0) return -1;
     }
-    return 0;
-}
-
-static int counter_inc_from_one(kh_counter_t *m, const char *key) {
-    int ret = 0;
-    khiter_t it = kh_put(counter, m, key, &ret);
-    if (ret < 0) return -1;
-    if (ret == 0) {
-        kh_val(m, it)++;
-        return 0;
-    }
-
-    char *owned = dup_cstr(key);
-    if (!owned) {
-        kh_del(counter, m, it);
-        return -1;
-    }
-    kh_key(m, it) = owned;
-    kh_val(m, it) = 1;
     return 0;
 }
 
@@ -223,7 +176,7 @@ static int add_matches_to_counter_hits(khash_t(strset) *found_sequences,
                                        kh_counter_t *map) {
     for (khint_t i = kh_begin(found_sequences); i != kh_end(found_sequences); ++i) {
         if (!kh_exist(found_sequences, i)) continue;
-        if (counter_inc_from_one(map, kh_key(found_sequences, i)) != 0) return -1;
+        if (counter_add_with_init(map, kh_key(found_sequences, i), 1, 1) != 0) return -1;
     }
     return 0;
 }
@@ -234,7 +187,6 @@ static int process_one_read(const char *read_name,
                             const char *read_seq,
                             const char *read_qual,
                             size_t read_len,
-                            const TrieNode *root,
                             kh_counter_t *counts,
                             const KmerBitset *seed_index,
                             int seed_mm,
@@ -288,7 +240,6 @@ static int process_one_read(const char *read_name,
                         &hits,
                         (uint32_t)min_len,
                         (uint32_t)max_len,
-                        root,
                         seed_index,
                         seed_mm,
                         matches,
@@ -341,104 +292,109 @@ cleanup:
     return status;
 }
 
-static int sam_chunk_queue_init(SamChunkQueue *q, size_t cap) {
-    if (!q || cap == 0) return -1;
-    memset(q, 0, sizeof(*q));
-    q->buf = (SamChunk*)calloc(cap, sizeof(*q->buf));
-    if (!q->buf) return -1;
-    q->cap = cap;
-    if (pthread_mutex_init(&q->mtx, NULL) != 0) {
-        free(q->buf);
-        q->buf = NULL;
-        return -1;
-    }
-    if (pthread_cond_init(&q->not_empty, NULL) != 0) {
-        pthread_mutex_destroy(&q->mtx);
-        free(q->buf);
-        q->buf = NULL;
-        return -1;
-    }
-    if (pthread_cond_init(&q->not_full, NULL) != 0) {
-        pthread_cond_destroy(&q->not_empty);
-        pthread_mutex_destroy(&q->mtx);
-        free(q->buf);
-        q->buf = NULL;
-        return -1;
-    }
-    return 0;
+// Shared ring-queue implementation used by both SAM chunks and FASTQ batches.
+#define DEFINE_RING_QUEUE_FUNCS(PREFIX, QueueType, ItemType, FreeItemFn)                  \
+static int PREFIX##_init(QueueType *q, size_t cap) {                                       \
+    if (!q || cap == 0) return -1;                                                         \
+    memset(q, 0, sizeof(*q));                                                               \
+    q->buf = (ItemType*)calloc(cap, sizeof(*q->buf));                                      \
+    if (!q->buf) return -1;                                                                 \
+    q->cap = cap;                                                                           \
+    if (pthread_mutex_init(&q->mtx, NULL) != 0) {                                           \
+        free(q->buf);                                                                       \
+        q->buf = NULL;                                                                      \
+        return -1;                                                                          \
+    }                                                                                       \
+    if (pthread_cond_init(&q->not_empty, NULL) != 0) {                                     \
+        pthread_mutex_destroy(&q->mtx);                                                     \
+        free(q->buf);                                                                       \
+        q->buf = NULL;                                                                      \
+        return -1;                                                                          \
+    }                                                                                       \
+    if (pthread_cond_init(&q->not_full, NULL) != 0) {                                      \
+        pthread_cond_destroy(&q->not_empty);                                                \
+        pthread_mutex_destroy(&q->mtx);                                                     \
+        free(q->buf);                                                                       \
+        q->buf = NULL;                                                                      \
+        return -1;                                                                          \
+    }                                                                                       \
+    return 0;                                                                               \
+}                                                                                           \
+                                                                                            \
+static void PREFIX##_request_abort(QueueType *q) {                                          \
+    pthread_mutex_lock(&q->mtx);                                                            \
+    q->aborted = 1;                                                                         \
+    pthread_cond_broadcast(&q->not_empty);                                                  \
+    pthread_cond_broadcast(&q->not_full);                                                   \
+    pthread_mutex_unlock(&q->mtx);                                                          \
+}                                                                                           \
+                                                                                            \
+static void PREFIX##_finish(QueueType *q) {                                                 \
+    pthread_mutex_lock(&q->mtx);                                                            \
+    q->done = 1;                                                                            \
+    pthread_cond_broadcast(&q->not_empty);                                                  \
+    pthread_mutex_unlock(&q->mtx);                                                          \
+}                                                                                           \
+                                                                                            \
+/* Returns 0 on success, -1 on abort. */                                                    \
+static int PREFIX##_push(QueueType *q, ItemType *item) {                                   \
+    pthread_mutex_lock(&q->mtx);                                                            \
+    while (q->size == q->cap && !q->aborted) {                                              \
+        pthread_cond_wait(&q->not_full, &q->mtx);                                           \
+    }                                                                                       \
+    if (q->aborted) {                                                                       \
+        pthread_mutex_unlock(&q->mtx);                                                      \
+        return -1;                                                                          \
+    }                                                                                       \
+                                                                                            \
+    q->buf[q->tail] = *item;                                                                \
+    q->tail = (q->tail + 1) % q->cap;                                                       \
+    q->size++;                                                                              \
+    pthread_cond_signal(&q->not_empty);                                                     \
+    pthread_mutex_unlock(&q->mtx);                                                          \
+    return 0;                                                                               \
+}                                                                                           \
+                                                                                            \
+/* Returns 0 on success, 1 on completion, -1 on abort. */                                   \
+static int PREFIX##_pop(QueueType *q, ItemType *item_out) {                                \
+    pthread_mutex_lock(&q->mtx);                                                            \
+    while (q->size == 0 && !q->done && !q->aborted) {                                       \
+        pthread_cond_wait(&q->not_empty, &q->mtx);                                          \
+    }                                                                                       \
+                                                                                            \
+    if (q->aborted) {                                                                       \
+        pthread_mutex_unlock(&q->mtx);                                                      \
+        return -1;                                                                          \
+    }                                                                                       \
+                                                                                            \
+    if (q->size == 0 && q->done) {                                                          \
+        pthread_mutex_unlock(&q->mtx);                                                      \
+        return 1;                                                                           \
+    }                                                                                       \
+                                                                                            \
+    *item_out = q->buf[q->head];                                                            \
+    memset(&q->buf[q->head], 0, sizeof(q->buf[q->head]));                                  \
+    q->head = (q->head + 1) % q->cap;                                                       \
+    q->size--;                                                                              \
+    pthread_cond_signal(&q->not_full);                                                      \
+    pthread_mutex_unlock(&q->mtx);                                                          \
+    return 0;                                                                               \
+}                                                                                           \
+                                                                                            \
+static void PREFIX##_destroy(QueueType *q) {                                                \
+    if (!q) return;                                                                         \
+    for (size_t i = 0; i < q->size; ++i) {                                                  \
+        size_t idx = (q->head + i) % q->cap;                                                \
+        FreeItemFn(&q->buf[idx]);                                                           \
+    }                                                                                       \
+    free(q->buf);                                                                           \
+    pthread_cond_destroy(&q->not_empty);                                                    \
+    pthread_cond_destroy(&q->not_full);                                                     \
+    pthread_mutex_destroy(&q->mtx);                                                         \
 }
 
-static void sam_chunk_queue_request_abort(SamChunkQueue *q) {
-    pthread_mutex_lock(&q->mtx);
-    q->aborted = 1;
-    pthread_cond_broadcast(&q->not_empty);
-    pthread_cond_broadcast(&q->not_full);
-    pthread_mutex_unlock(&q->mtx);
-}
-
-static void sam_chunk_queue_finish(SamChunkQueue *q) {
-    pthread_mutex_lock(&q->mtx);
-    q->done = 1;
-    pthread_cond_broadcast(&q->not_empty);
-    pthread_mutex_unlock(&q->mtx);
-}
-
-// Returns 0 on success, -1 on abort.
-static int sam_chunk_queue_push(SamChunkQueue *q, SamChunk *chunk) {
-    pthread_mutex_lock(&q->mtx);
-    while (q->size == q->cap && !q->aborted) {
-        pthread_cond_wait(&q->not_full, &q->mtx);
-    }
-    if (q->aborted) {
-        pthread_mutex_unlock(&q->mtx);
-        return -1;
-    }
-
-    q->buf[q->tail] = *chunk;
-    q->tail = (q->tail + 1) % q->cap;
-    q->size++;
-    pthread_cond_signal(&q->not_empty);
-    pthread_mutex_unlock(&q->mtx);
-    return 0;
-}
-
-// Returns 0 on success, 1 on completion, -1 on abort.
-static int sam_chunk_queue_pop(SamChunkQueue *q, SamChunk *chunk_out) {
-    pthread_mutex_lock(&q->mtx);
-    while (q->size == 0 && !q->done && !q->aborted) {
-        pthread_cond_wait(&q->not_empty, &q->mtx);
-    }
-
-    if (q->aborted) {
-        pthread_mutex_unlock(&q->mtx);
-        return -1;
-    }
-
-    if (q->size == 0 && q->done) {
-        pthread_mutex_unlock(&q->mtx);
-        return 1;
-    }
-
-    *chunk_out = q->buf[q->head];
-    memset(&q->buf[q->head], 0, sizeof(q->buf[q->head]));
-    q->head = (q->head + 1) % q->cap;
-    q->size--;
-    pthread_cond_signal(&q->not_full);
-    pthread_mutex_unlock(&q->mtx);
-    return 0;
-}
-
-static void sam_chunk_queue_destroy(SamChunkQueue *q) {
-    if (!q) return;
-    for (size_t i = 0; i < q->size; ++i) {
-        size_t idx = (q->head + i) % q->cap;
-        free_sam_chunk(&q->buf[idx]);
-    }
-    free(q->buf);
-    pthread_cond_destroy(&q->not_empty);
-    pthread_cond_destroy(&q->not_full);
-    pthread_mutex_destroy(&q->mtx);
-}
+DEFINE_RING_QUEUE_FUNCS(sam_chunk_queue, SamChunkQueue, SamChunk, free_sam_chunk)
+DEFINE_RING_QUEUE_FUNCS(fastq_queue, FastqTaskQueue, FastqBatch, free_fastq_batch)
 
 static void *sam_writer_main(void *arg) {
     SamWriterCtx *ctx = (SamWriterCtx*)arg;
@@ -462,104 +418,6 @@ static void *sam_writer_main(void *arg) {
     return NULL;
 }
 
-static int fastq_queue_init(FastqTaskQueue *q, size_t cap) {
-    if (!q || cap == 0) return -1;
-    memset(q, 0, sizeof(*q));
-    q->buf = (FastqTask*)calloc(cap, sizeof(*q->buf));
-    if (!q->buf) return -1;
-    q->cap = cap;
-    if (pthread_mutex_init(&q->mtx, NULL) != 0) {
-        free(q->buf);
-        q->buf = NULL;
-        return -1;
-    }
-    if (pthread_cond_init(&q->not_empty, NULL) != 0) {
-        pthread_mutex_destroy(&q->mtx);
-        free(q->buf);
-        q->buf = NULL;
-        return -1;
-    }
-    if (pthread_cond_init(&q->not_full, NULL) != 0) {
-        pthread_cond_destroy(&q->not_empty);
-        pthread_mutex_destroy(&q->mtx);
-        free(q->buf);
-        q->buf = NULL;
-        return -1;
-    }
-    return 0;
-}
-
-static void fastq_queue_request_abort(FastqTaskQueue *q) {
-    pthread_mutex_lock(&q->mtx);
-    q->aborted = 1;
-    pthread_cond_broadcast(&q->not_empty);
-    pthread_cond_broadcast(&q->not_full);
-    pthread_mutex_unlock(&q->mtx);
-}
-
-static void fastq_queue_finish(FastqTaskQueue *q) {
-    pthread_mutex_lock(&q->mtx);
-    q->done = 1;
-    pthread_cond_broadcast(&q->not_empty);
-    pthread_mutex_unlock(&q->mtx);
-}
-
-// Returns 0 on success, -1 on abort.
-static int fastq_queue_push(FastqTaskQueue *q, FastqBatch *batch) {
-    pthread_mutex_lock(&q->mtx);
-    while (q->size == q->cap && !q->aborted) {
-        pthread_cond_wait(&q->not_full, &q->mtx);
-    }
-    if (q->aborted) {
-        pthread_mutex_unlock(&q->mtx);
-        return -1;
-    }
-
-    q->buf[q->tail] = *batch;
-    q->tail = (q->tail + 1) % q->cap;
-    q->size++;
-    pthread_cond_signal(&q->not_empty);
-    pthread_mutex_unlock(&q->mtx);
-    return 0;
-}
-
-// Returns 0 on success, 1 on completion, -1 on abort.
-static int fastq_queue_pop(FastqTaskQueue *q, FastqBatch *batch_out) {
-    pthread_mutex_lock(&q->mtx);
-    while (q->size == 0 && !q->done && !q->aborted) {
-        pthread_cond_wait(&q->not_empty, &q->mtx);
-    }
-
-    if (q->aborted) {
-        pthread_mutex_unlock(&q->mtx);
-        return -1;
-    }
-
-    if (q->size == 0 && q->done) {
-        pthread_mutex_unlock(&q->mtx);
-        return 1;
-    }
-
-    *batch_out = q->buf[q->head];
-    memset(&q->buf[q->head], 0, sizeof(q->buf[q->head]));
-    q->head = (q->head + 1) % q->cap;
-    q->size--;
-    pthread_cond_signal(&q->not_full);
-    pthread_mutex_unlock(&q->mtx);
-    return 0;
-}
-
-static void fastq_queue_destroy(FastqTaskQueue *q) {
-    if (!q) return;
-    for (size_t i = 0; i < q->size; ++i) {
-        size_t idx = (q->head + i) % q->cap;
-        free_fastq_batch(&q->buf[idx]);
-    }
-    free(q->buf);
-    pthread_cond_destroy(&q->not_empty);
-    pthread_cond_destroy(&q->not_full);
-    pthread_mutex_destroy(&q->mtx);
-}
 
 static void *fastq_worker_main(void *arg) {
     FastqWorkerCtx *ctx = (FastqWorkerCtx*)arg;
@@ -583,7 +441,6 @@ static void *fastq_worker_main(void *arg) {
                                  task->seq,
                                  task->qual,
                                  task->len,
-                                 ctx->root,
                                  ctx->local_counts,
                                  ctx->seed_index,
                                  ctx->seed_mm,
@@ -644,7 +501,6 @@ static int load_fastq_single(const char *path,
                              ks->seq.s,
                              ks->qual.l ? ks->qual.s : NULL,
                              ks->seq.l,
-                             root,
                              counts,
                              seed_index,
                              seed_mm,
@@ -752,7 +608,6 @@ static int load_fastq_mt(const char *path,
     for (size_t i = 0; i < threads; ++i) {
         ctxs[i].queue = &queue;
         ctxs[i].sam_queue = use_sam_writer ? &sam_queue : NULL;
-        ctxs[i].root = root;
         ctxs[i].seed_index = seed_index;
         ctxs[i].min_len = (uint32_t)(*min_len);
         ctxs[i].max_len = (uint32_t)(*max_len);
@@ -773,7 +628,7 @@ static int load_fastq_mt(const char *path,
     size_t nreads = 0;
     int l = 0;
     FastqBatch pending = {0};
-    pending.tasks = (FastqTask*)calloc(MT_READ_BATCH_SIZE, sizeof(*pending.tasks));
+    pending.tasks = (FastqTask*)calloc(MT_READ_BATCH_MAX_READS, sizeof(*pending.tasks));
     if (!pending.tasks) {
         status = 1;
         fastq_queue_request_abort(&queue);
@@ -798,7 +653,8 @@ static int load_fastq_mt(const char *path,
             }
 
             pending.tasks[pending.n++] = task;
-            if (pending.n == MT_READ_BATCH_SIZE) {
+            pending.bases += task.len;
+            if (pending.bases >= MT_READ_BATCH_TARGET_BASES || pending.n == MT_READ_BATCH_MAX_READS) {
                 FastqBatch out = pending;
                 if (fastq_queue_push(&queue, &out) != 0) {
                     free_fastq_batch(&out);
@@ -807,10 +663,12 @@ static int load_fastq_mt(const char *path,
                     if (use_sam_writer) sam_chunk_queue_request_abort(&sam_queue);
                     pending.tasks = NULL;
                     pending.n = 0;
+                    pending.bases = 0;
                     break;
                 }
-                pending.tasks = (FastqTask*)calloc(MT_READ_BATCH_SIZE, sizeof(*pending.tasks));
+                pending.tasks = (FastqTask*)calloc(MT_READ_BATCH_MAX_READS, sizeof(*pending.tasks));
                 pending.n = 0;
+                pending.bases = 0;
                 if (!pending.tasks) {
                     status = 1;
                     fastq_queue_request_abort(&queue);
@@ -838,6 +696,7 @@ static int load_fastq_mt(const char *path,
             }
             pending.tasks = NULL;
             pending.n = 0;
+            pending.bases = 0;
         }
         free_fastq_batch(&pending);
     }
@@ -940,7 +799,7 @@ int load_reference(const char *path, TrieNode *root, kh_counter_t *map,
 
         normalize_acgt(seq);
 
-        size_t L = ks->seq.l; // length of this record’s sequence
+        size_t L = ks->seq.l; // length of this record's sequence
         if (L < min_len) min_len = L;
         if (L > max_len) max_len = L;
 

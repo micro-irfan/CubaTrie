@@ -16,6 +16,7 @@ typedef khash_t(counter) kh_counter_t;
 
 // Functions that operate on the map
 void counter_inc(kh_counter_t *m, const char *key);
+int counter_add_with_init(kh_counter_t *m, const char *key, size_t add, size_t init_if_new);
 // size_t counter_get(const kh_counter_t *m, const char *key);
 // void counter_print(const kh_counter_t *m);
 void counter_free(kh_counter_t *m);   // frees keys + destroys map
@@ -35,7 +36,7 @@ typedef struct {
 
 // ---------- Found type returned by trie ----------
 typedef struct {
-    uint32_t start_pos;           // start pos relative to the query’s start
+    uint32_t start_pos;           // start pos relative to the query's start
     const char *sequence_name;    // pointer owned by the trie (non-owning here)
 } Found;
 
@@ -59,6 +60,13 @@ static inline void normalize_acgt(char *s) {
             default: *p = 'N'; break;
         }
     }
+}
+
+static inline size_t name_len_no_rc_suffix(const char *name) {
+    if (!name) return 0;
+    size_t n = strlen(name);
+    if (n >= 3 && name[n - 3] == '/' && name[n - 2] == 'r' && name[n - 1] == 'c') return n - 3;
+    return n;
 }
 
 
@@ -95,6 +103,6 @@ typedef struct {
     size_t      count;
 } counter_entry_t;
 
-counter_write_csv_sorted_collapse_rc(const kh_counter_t *m, const char *path, size_t topk);
+int counter_write_csv_sorted_collapse_rc(const kh_counter_t *m, const char *path, size_t topk);
 
 #endif /* UTILS_H */
