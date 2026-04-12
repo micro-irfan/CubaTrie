@@ -10,11 +10,13 @@ typedef struct {
     const char *ref;   // -r/--reference
     const char *out;         // -o/--output  ("-" means stdout)
     const char *sam;         // --sam FILE (or "-")
+    int sam_soft_clip;       // --soft-clip
     int k;                   // -k/--kmer (seed k)
     int seed_mm;             // --seed-mm
     int rc; 
     int verbose;
     int mm;
+    int exclude_multihit;
     unsigned threads;
     TrieDupPolicy dup_policy;
 } Options;
@@ -27,8 +29,10 @@ static void usage(const char *prog) {
         "  -r, --reference FILE    reference FASTA/FASTQ (required)\n"
         "  -o, --output FILE       output CSV (default: counts.csv)\n"
         "  -s, --sam FILE          output SAM alignments (use \"-\" for stdout)\n"
+        "      --soft-clip         use soft clipping (S) in SAM CIGAR (default: hard clip H)\n"
         "  -k, --kmer INT          seed k-mer length for prefilter [1..12] (default: 8)\n"
         "      --seed-mm INT       allowed seed mismatches [0|1] (default: 0)\n"
+        "      --exclude-multihit  do not count reads with >1 reference hit\n"
         "      --no-rc             Disable Reverse Complement (default off)\n"
         "      --indels            Include Indels (default off) (Currently Not Supported)\n"
         "  -m, --mismatch INT      Number of mismatches allowed [0..5] (default: --seed-mm)\n"
@@ -54,7 +58,9 @@ int parse_args(int argc, char **argv, Options *opt, int *pos_start) {
         {"output",    ko_required_argument, 'o'},
         {"sam",       ko_required_argument, 's'},
         {"kmer",      ko_required_argument, 'k'},
+        {"soft-clip", ko_no_argument,       304},
         {"seed-mm",   ko_required_argument, 302},
+        {"exclude-multihit", ko_no_argument, 303},
         {"dup-policy",ko_required_argument, 'd'},
         {"no-rc",     ko_no_argument      , 301},
         {"threads",   ko_required_argument, 't'},
@@ -68,12 +74,14 @@ int parse_args(int argc, char **argv, Options *opt, int *pos_start) {
     opt->ref = "";
     opt->out = "counts.csv";
     opt->sam = NULL;
+    opt->sam_soft_clip = 0;
     opt->k = 8;
     opt->seed_mm = 0;
     opt->rc = 1;
     opt->verbose = 0;
     opt->threads = 1;
     opt->mm = 0;
+    opt->exclude_multihit = 0;
     opt->dup_policy = TRIE_DUP_ERROR;
 
     ketopt_t o = KETOPT_INIT;
@@ -86,12 +94,18 @@ int parse_args(int argc, char **argv, Options *opt, int *pos_start) {
         case 'o': opt->out = o.arg; break;
         case 's': opt->sam = o.arg; break;
         case 'k': opt->k = atoi(o.arg); break;
+        case 304:
+            opt->sam_soft_clip = 1;
+            break;
         case 302:
             opt->seed_mm = atoi(o.arg);
             if (opt->seed_mm < 0 || opt->seed_mm > 1) {
                 fprintf(stderr, "Invalid --seed-mm '%s'. Use: 0 or 1\n", o.arg);
                 return -6;
             }
+            break;
+        case 303:
+            opt->exclude_multihit = 1;
             break;
         case 'd':
             if (parse_dup_policy(o.arg, &opt->dup_policy) != 0) {
@@ -158,7 +172,9 @@ int load_fastq(const char *path,
                size_t *min_out, 
                size_t *max_out, 
                int k_mm,
+               int exclude_multihit,
                FILE *sam_fp,
+               int sam_soft_clip,
                unsigned threads);
 
 
@@ -206,7 +222,8 @@ int main(int argc, char **argv) {
     }
 
     // Find Reference in Queries
-    if (load_fastq(opt.in, root, map, opt.k, opt.seed_mm, &min_len, &max_len, opt.mm, sam_fp, opt.threads) != 0) {
+    if (load_fastq(opt.in, root, map, opt.k, opt.seed_mm, &min_len, &max_len, opt.mm,
+                   opt.exclude_multihit, sam_fp, opt.sam_soft_clip, opt.threads) != 0) {
         fprintf(stderr, "Failed while loading input reads.\n");
         if (sam_fp && sam_fp != stdout) fclose(sam_fp);
         counter_free(map);

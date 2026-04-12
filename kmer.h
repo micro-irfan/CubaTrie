@@ -53,7 +53,8 @@ void find_matches(const char *sequence, size_t seq_len,
                   int k_mm,
                   const char *read_name,
                   const char *read_qual,
-                  FILE *sam_fp);
+                  FILE *sam_fp,
+                  int sam_soft_clip);
 
 void find_matches_seeded(const char *sequence, size_t seq_len,
                          const u32vec_t *hit,
@@ -64,4 +65,5 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
                          int k_mm,
                          const char *read_name,
                          const char *read_qual,
-                         FILE *sam_fp);
+                         FILE *sam_fp,
+                         int sam_soft_clip);

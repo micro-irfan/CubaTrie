@@ -1,6 +1,6 @@
 # cubaTrie
 
-cubaTrie is a Short Reference (20-30bp) Mapper employing Radix Trie Structure For Querying generic Longer Reads (>50bp) or Larger Sequences like viral sequences to find conserved target sequences. Cuba (pronounced as Chew-bah and not the country Q-ba) means to try in the Malay Language. Essentially, the tool means Try Try*.
+cubaTrie is a Short Reference (20-30bp) Mapper employing Compressed Radix Trie Structure For Querying generic Longer Reads (>50bp) or Larger Sequences like viral sequences to find conserved target sequences. Cuba (pronounced as Chew-bah and not the country Q-ba) means to try in the Malay Language. Essentially, the tool means Try Try*.
 
 ## Getting Started
 
@@ -41,6 +41,9 @@ fastp \
     --thread 8
 
 ./cubaTrie -r ref.fa -i ${sample_id}.merged.fastq.gz -o ${sample_id}.counts.csv -k 8 -m 1 -t 8
+
+# SAM File Output
+./cubaTrie -r ref.fa -i ${sample_id}.merged.fastq.gz -o ${sample_id}.counts.csv -k 8 -m 1 -t 8 --sam ${sample_id}.sam
 ```
 
 ## CLI Options
@@ -55,9 +58,11 @@ fastp \
 | `-r`, `--reference FILE` | Reference FASTA/FASTQ used to build the trie. | none |
 | `-o`, `--output FILE` | Output CSV path. | `counts.csv` |
 | `-s`, `--sam FILE` | Write SAM alignments. Use `-` for stdout. | off |
+| `--soft-clip` | Use soft clipping (`S`) for SAM CIGAR and keep full read in `SEQ/QUAL` for debugging; if omitted, hard clipping (`H`) is used. | off (hard clip) |
 | `-k`, `--kmer INT` | Seed k-mer length for prefilter. Allowed: `1..12`. | `8` |
 | `--seed-mm INT` | Seed mismatches allowed. Allowed: `0` or `1`. | `0` |
-| `-m`, `--mismatch INT` | Total mismatches allowed during extension. Clamped to `0..5`. | `0` |
+| `-m`, `--mismatch INT` | Total mismatches allowed during extension. Clamped to `0..5`; if omitted, defaults to `--seed-mm`. | `0` or `1` (inherits `--seed-mm`) |
+| `--exclude-multihit` | Exclude reads with more than one reference hit from final counting (SAM output unaffected). | off |
 | `-t`, `--threads UINT` | Number of worker threads. | `1` |
 | `-d`, `--dup-policy MODE` | Duplicate reference handling: `error`, `warn`, `ignore`. | `error` |
 | `--no-rc` | Do not add reverse complements of references. | off |
@@ -73,8 +78,13 @@ fastp \
 # With SAM output and multithreading
 ./cubaTrie -r reference.fasta -i reads.fastq.gz -o counts.csv -s output.sam -t 8
 
+# With SAM soft clipping (default is hard clipping if omitted)
+./cubaTrie -r reference.fasta -i reads.fastq.gz -o counts.csv -s output.sam --soft-clip
+
 # More sensitive seeding (allow 1 mismatch in seed and query)
 ./cubaTrie -r reference.fasta -i reads.fastq.gz -k 8 --seed-mm 1 -m 1 -o counts.csv
 
-```
+# Exclude multi-hit reads from count table
+./cubaTrie -r reference.fasta -i reads.fastq.gz --exclude-multihit -o counts.csv
 
+```

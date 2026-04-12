@@ -113,6 +113,8 @@ typedef struct {
     uint32_t max_len;
     int seed_mm;
     int k_mm;
+    int exclude_multihit;
+    int sam_soft_clip;
     FILE *sam_fp;
     kh_counter_t *local_counts;
     int status;
@@ -193,6 +195,8 @@ static int process_one_read(const char *read_name,
                             size_t min_len,
                             size_t max_len,
                             int k_mm,
+                            int exclude_multihit,
+                            int sam_soft_clip,
                             FILE *sam_fp,
                             SamChunkQueue *sam_queue,
                             int counts_preseeded) {
@@ -246,7 +250,8 @@ static int process_one_read(const char *read_name,
                         k_mm,
                         read_name,
                         read_qual,
-                        sam_out);
+                        sam_out,
+                        sam_soft_clip);
 
     if (sam_out && kh_size(matches) == 0) {
         if (sam_queue) {
@@ -258,11 +263,13 @@ static int process_one_read(const char *read_name,
         }
     }
 
-    if (counts_preseeded) {
-        add_to_counter(matches, counts);
-    } else if (add_matches_to_counter_hits(matches, counts) != 0) {
-        status = 1;
-        goto cleanup;
+    if (!(exclude_multihit && kh_size(matches) > 1)) {
+        if (counts_preseeded) {
+            add_to_counter(matches, counts);
+        } else if (add_matches_to_counter_hits(matches, counts) != 0) {
+            status = 1;
+            goto cleanup;
+        }
     }
 
 cleanup:
@@ -447,6 +454,8 @@ static void *fastq_worker_main(void *arg) {
                                  ctx->min_len,
                                  ctx->max_len,
                                  ctx->k_mm,
+                                 ctx->exclude_multihit,
+                                 ctx->sam_soft_clip,
                                  ctx->sam_fp,
                                  ctx->sam_queue,
                                  0) != 0) {
@@ -473,6 +482,8 @@ static int load_fastq_single(const char *path,
                              size_t *min_len,
                              size_t *max_len,
                              int k_mm,
+                             int exclude_multihit,
+                             int sam_soft_clip,
                              FILE *sam_fp) {
     gzFile fp = gzopen(path, "rb");
     if (fp == 0) { perror("gzopen"); return 1; }
@@ -507,6 +518,8 @@ static int load_fastq_single(const char *path,
                              *min_len,
                              *max_len,
                              k_mm,
+                             exclude_multihit,
+                             sam_soft_clip,
                              sam_fp,
                              NULL,
                              1) != 0) {
@@ -533,6 +546,8 @@ static int load_fastq_mt(const char *path,
                          size_t *min_len,
                          size_t *max_len,
                          int k_mm,
+                         int exclude_multihit,
+                         int sam_soft_clip,
                          FILE *sam_fp,
                          unsigned threads) {
     SamChunkQueue sam_queue;
@@ -613,6 +628,8 @@ static int load_fastq_mt(const char *path,
         ctxs[i].max_len = (uint32_t)(*max_len);
         ctxs[i].seed_mm = seed_mm;
         ctxs[i].k_mm = k_mm;
+        ctxs[i].exclude_multihit = exclude_multihit;
+        ctxs[i].sam_soft_clip = sam_soft_clip;
         ctxs[i].sam_fp = sam_fp;
         ctxs[i].local_counts = NULL;
         ctxs[i].status = 0;
@@ -751,12 +768,15 @@ static int load_fastq_mt(const char *path,
 }
 
 int load_fastq(const char *path, TrieNode *root, kh_counter_t *counts,
-               int kmerlen, int seed_mm, size_t *min_len, size_t *max_len, int k_mm, FILE *sam_fp,
+               int kmerlen, int seed_mm, size_t *min_len, size_t *max_len, int k_mm,
+               int exclude_multihit, FILE *sam_fp, int sam_soft_clip,
                unsigned threads) {
     if (threads <= 1) {
-        return load_fastq_single(path, root, counts, kmerlen, seed_mm, min_len, max_len, k_mm, sam_fp);
+        return load_fastq_single(path, root, counts, kmerlen, seed_mm, min_len, max_len, k_mm,
+                                 exclude_multihit, sam_soft_clip, sam_fp);
     }
-    return load_fastq_mt(path, root, counts, kmerlen, seed_mm, min_len, max_len, k_mm, sam_fp, threads);
+    return load_fastq_mt(path, root, counts, kmerlen, seed_mm, min_len, max_len, k_mm,
+                         exclude_multihit, sam_soft_clip, sam_fp, threads);
 }
 
 

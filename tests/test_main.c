@@ -127,12 +127,43 @@ static void test_find_matches_sam_line(void) {
     FILE *fp = tmpfile();
     assert(fp != NULL);
 
-    find_matches("TTACCTAA", 8, &hit, 4, 4, root, found, 1, "readX/rc", "HHHXHHHH", fp);
+    find_matches("TTACCTAA", 8, &hit, 4, 4, root, found, 1, "readX/rc", "HHHXHHHH", fp, 0);
 
     char *sam = read_tmpfile_all(fp);
     assert(sam != NULL);
 
     assert(strstr(sam, "readX\t16\tref1\t1\t255\t2H4M2H\t*\t0\t0\tACCT\tHHXH\tNM:i:1") != NULL);
+    assert(strstr(sam, "/rc\t") == NULL);
+    assert(strstr(sam, "\tNH:i:") == NULL);
+
+    free(sam);
+    fclose(fp);
+    kv_destroy(hit);
+    free_strset_keys_and_destroy(found);
+    trie_free_node(root);
+}
+
+static void test_find_matches_sam_line_soft_clip(void) {
+    TrieNode *root = trie_create_node();
+    assert(root != NULL);
+    assert(trie_insert(root, "ACGT", "ref1/rc", 1) == TRIE_INSERT_OK);
+
+    u32vec_t hit;
+    kv_init(hit);
+    kv_push(uint32_t, 0, hit, 2);
+
+    khash_t(strset) *found = kh_init(strset);
+    assert(found != NULL);
+
+    FILE *fp = tmpfile();
+    assert(fp != NULL);
+
+    find_matches("TTACCTAA", 8, &hit, 4, 4, root, found, 1, "readX/rc", "HHHXHHHH", fp, 1);
+
+    char *sam = read_tmpfile_all(fp);
+    assert(sam != NULL);
+
+    assert(strstr(sam, "readX\t16\tref1\t1\t255\t2S4M2S\t*\t0\t0\tTTACCTAA\tHHHXHHHH\tNM:i:1") != NULL);
     assert(strstr(sam, "/rc\t") == NULL);
     assert(strstr(sam, "\tNH:i:") == NULL);
 
@@ -160,7 +191,7 @@ static void test_find_matches_multihit_qname_tag(void) {
     FILE *fp = tmpfile();
     assert(fp != NULL);
 
-    find_matches("ACGTA", 5, &hit, 4, 4, root, found, 0, "readMulti", NULL, fp);
+    find_matches("ACGTA", 5, &hit, 4, 4, root, found, 0, "readMulti", NULL, fp, 0);
 
     char *sam = read_tmpfile_all(fp);
     assert(sam != NULL);
@@ -207,6 +238,7 @@ int main(void) {
     test_trie_search_exact_mm();
     test_find_kmer_bitset_seed_mm();
     test_find_matches_sam_line();
+    test_find_matches_sam_line_soft_clip();
     test_find_matches_multihit_qname_tag();
     test_sam_header_strip_and_dedupe();
 

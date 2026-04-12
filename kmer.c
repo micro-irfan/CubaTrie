@@ -59,22 +59,24 @@ static void sam_write_alignment(FILE *sam_fp,
                                 size_t match_start,
                                 size_t match_len,
                                 int nm,
-                                int nh) {
+                                int nh,
+                                int sam_soft_clip) {
     if (!sam_fp || !read_name || !read_seq || !ref_name) return;
     if (match_start >= read_len) return;
     if (match_len > read_len - match_start) match_len = read_len - match_start;
     if (match_len == 0) return;
 
-    size_t hard_start = match_start;
-    size_t hard_end = read_len - match_start - match_len;
+    size_t clip_start = match_start;
+    size_t clip_end = read_len - match_start - match_len;
     char cigar[96];
+    char clip_op = sam_soft_clip ? 'S' : 'H';
 
-    if (hard_start > 0 && hard_end > 0) {
-        snprintf(cigar, sizeof(cigar), "%zuH%zuM%zuH", hard_start, match_len, hard_end);
-    } else if (hard_start > 0) {
-        snprintf(cigar, sizeof(cigar), "%zuH%zuM", hard_start, match_len);
-    } else if (hard_end > 0) {
-        snprintf(cigar, sizeof(cigar), "%zuM%zuH", match_len, hard_end);
+    if (clip_start > 0 && clip_end > 0) {
+        snprintf(cigar, sizeof(cigar), "%zu%c%zuM%zu%c", clip_start, clip_op, match_len, clip_end, clip_op);
+    } else if (clip_start > 0) {
+        snprintf(cigar, sizeof(cigar), "%zu%c%zuM", clip_start, clip_op, match_len);
+    } else if (clip_end > 0) {
+        snprintf(cigar, sizeof(cigar), "%zuM%zu%c", match_len, clip_end, clip_op);
     } else {
         snprintf(cigar, sizeof(cigar), "%zuM", match_len);
     }
@@ -84,31 +86,42 @@ static void sam_write_alignment(FILE *sam_fp,
     size_t qname_len = name_len_no_rc_suffix(read_name);
     size_t rname_len = name_len_no_rc_suffix(ref_name);
 
-    // For hard clipping, output only the aligned segment in SEQ/QUAL.
+    const char *seq_out = read_seq;
+    const char *qual_out = read_qual;
+    size_t seq_out_len = read_len;
+    size_t qual_out_len = read_len;
+    if (!sam_soft_clip) {
+        // For hard clipping, output only the aligned segment in SEQ/QUAL.
+        seq_out = read_seq + match_start;
+        seq_out_len = match_len;
+        qual_out = read_qual ? (read_qual + match_start) : NULL;
+        qual_out_len = match_len;
+    }
+
     if (has_full_qual) {
         if (nh > 1) {
             fprintf(sam_fp, "%.*s\t%d\t%.*s\t1\t255\t%s\t*\t0\t0\t%.*s\t%.*s\tNM:i:%d\tNH:i:%d\n",
                     (int)qname_len, read_name, flag, (int)rname_len, ref_name, cigar,
-                    (int)match_len, read_seq + match_start,
-                    (int)match_len, read_qual + match_start,
+                    (int)seq_out_len, seq_out,
+                    (int)qual_out_len, qual_out,
                     nm, nh);
         } else {
             fprintf(sam_fp, "%.*s\t%d\t%.*s\t1\t255\t%s\t*\t0\t0\t%.*s\t%.*s\tNM:i:%d\n",
                     (int)qname_len, read_name, flag, (int)rname_len, ref_name, cigar,
-                    (int)match_len, read_seq + match_start,
-                    (int)match_len, read_qual + match_start,
+                    (int)seq_out_len, seq_out,
+                    (int)qual_out_len, qual_out,
                     nm);
         }
     } else {
         if (nh > 1) {
             fprintf(sam_fp, "%.*s\t%d\t%.*s\t1\t255\t%s\t*\t0\t0\t%.*s\t*\tNM:i:%d\tNH:i:%d\n",
                     (int)qname_len, read_name, flag, (int)rname_len, ref_name, cigar,
-                    (int)match_len, read_seq + match_start,
+                    (int)seq_out_len, seq_out,
                     nm, nh);
         } else {
             fprintf(sam_fp, "%.*s\t%d\t%.*s\t1\t255\t%s\t*\t0\t0\t%.*s\t*\tNM:i:%d\n",
                     (int)qname_len, read_name, flag, (int)rname_len, ref_name, cigar,
-                    (int)match_len, read_seq + match_start,
+                    (int)seq_out_len, seq_out,
                     nm);
         }
     }
@@ -353,7 +366,8 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
                          int k_mm,
                          const char *read_name,
                          const char *read_qual,
-                         FILE *sam_fp) {
+                         FILE *sam_fp,
+                         int sam_soft_clip) {
     if (!sequence || !hit || !seed_index || !found_sequences) return;
     if (seed_mm < 0) seed_mm = 0;
     if (seed_mm > 1) seed_mm = 1;
@@ -460,7 +474,8 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
                                 sam_records.a[i].match_start,
                                 sam_records.a[i].match_len,
                                 sam_records.a[i].nm,
-                                nh);
+                                nh,
+                                sam_soft_clip);
         }
         funlockfile(sam_fp);
     }
@@ -500,7 +515,8 @@ void find_matches(const char *sequence, size_t seq_len,
                   int k_mm,
                   const char *read_name,
                   const char *read_qual,
-                  FILE *sam_fp)
+                  FILE *sam_fp,
+                  int sam_soft_clip)
 {
     khash_t(posset) *start_pos_cache = kh_init(posset);   // dedupe absolute start positions
     kFoundVec matches; kv_init(matches);
@@ -574,7 +590,8 @@ void find_matches(const char *sequence, size_t seq_len,
                                 sam_records.a[i].match_start,
                                 sam_records.a[i].match_len,
                                 sam_records.a[i].nm,
-                                nh);
+                                nh,
+                                sam_soft_clip);
         }
         funlockfile(sam_fp);
     }

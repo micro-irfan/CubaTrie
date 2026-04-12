@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <zlib.h>
 
 #include "../trie.h"
 #include "../utils.h"
@@ -10,8 +11,8 @@ int load_reference(const char *path, TrieNode *root, kh_counter_t *map,
                    size_t *min_out, size_t *max_out, size_t *n_out,
                    int add_revcomp, size_t *kmer_len, TrieDupPolicy dup_policy);
 int load_fastq(const char *path, TrieNode *root, kh_counter_t *counts,
-               int kmerlen, int seed_mm, size_t *min_len, size_t *max_len, int k_mm, FILE *sam_fp,
-               unsigned threads);
+               int kmerlen, int seed_mm, size_t *min_len, size_t *max_len, int k_mm,
+               int exclude_multihit, FILE *sam_fp, int sam_soft_clip, unsigned threads);
 
 static int file_exists(const char *path) {
     FILE *fp = fopen(path, "rb");
@@ -69,7 +70,106 @@ static int compare_text_files(const char *expected, const char *actual, const ch
     return diff;
 }
 
+static size_t counter_get_or_zero(const kh_counter_t *m, const char *key) {
+    if (!m || !key) return 0;
+    khiter_t it = kh_get(counter, m, key);
+    if (it == kh_end(m)) return 0;
+    return kh_val(m, it);
+}
+
+static int write_test_fastq_gz(const char *path) {
+    gzFile fp = gzopen(path, "wb");
+    if (!fp) return 1;
+    const char *fastq =
+        "@r_multi\n"
+        "ACGTA\n"
+        "+\n"
+        "IIIII\n"
+        "@r_single\n"
+        "AACGT\n"
+        "+\n"
+        "IIIII\n";
+    int ok = (gzputs(fp, fastq) >= 0) ? 0 : 1;
+    gzclose(fp);
+    return ok;
+}
+
+static int run_multihit_counting_case(const char *reads_path, int exclude_multihit,
+                                      size_t *refA_out, size_t *refB_out) {
+    TrieNode *root = trie_create_node();
+    kh_counter_t *map = kh_init(counter);
+    if (!root || !map) {
+        if (root) trie_free_node(root);
+        if (map) kh_destroy(counter, map);
+        return 1;
+    }
+    if (trie_insert(root, "ACGT", "refA", 0) != TRIE_INSERT_OK ||
+        trie_insert(root, "CGTA", "refB", 0) != TRIE_INSERT_OK) {
+        counter_free(map);
+        trie_free_node(root);
+        return 1;
+    }
+    if (counter_add_with_init(map, "refA", 0, 0) != 0 ||
+        counter_add_with_init(map, "refB", 0, 0) != 0) {
+        counter_free(map);
+        trie_free_node(root);
+        return 1;
+    }
+
+    size_t min_len = 4, max_len = 4;
+    int rc = load_fastq(reads_path, root, map, 4, 0, &min_len, &max_len, 0, exclude_multihit, NULL, 0, 1);
+    if (rc != 0) {
+        counter_free(map);
+        trie_free_node(root);
+        return 1;
+    }
+
+    *refA_out = counter_get_or_zero(map, "refA");
+    *refB_out = counter_get_or_zero(map, "refB");
+    counter_free(map);
+    trie_free_node(root);
+    return 0;
+}
+
+static int test_exclude_multihit_counting(void) {
+    const char *reads_path = "tests/golden/tmp.multihit.fastq.gz";
+    if (write_test_fastq_gz(reads_path) != 0) {
+        fprintf(stderr, "ERROR: failed to write test FASTQ fixture: %s\n", reads_path);
+        return 1;
+    }
+
+    size_t refA_keep = 0, refB_keep = 0;
+    size_t refA_excl = 0, refB_excl = 0;
+    int failed = 0;
+
+    if (run_multihit_counting_case(reads_path, 0, &refA_keep, &refB_keep) != 0) failed = 1;
+    if (run_multihit_counting_case(reads_path, 1, &refA_excl, &refB_excl) != 0) failed = 1;
+
+    remove(reads_path);
+
+    if (failed) {
+        fprintf(stderr, "ERROR: multihit counting test setup failed.\n");
+        return 1;
+    }
+
+    // Without exclusion: r_multi contributes to refA and refB; r_single contributes to refA.
+    if (refA_keep != 2 || refB_keep != 1) {
+        fprintf(stderr, "MISMATCH: expected keep counts refA=2 refB=1, got refA=%zu refB=%zu\n",
+                refA_keep, refB_keep);
+        return 1;
+    }
+    // With exclusion: r_multi is ignored for counting; only r_single counts.
+    if (refA_excl != 1 || refB_excl != 0) {
+        fprintf(stderr, "MISMATCH: expected exclude counts refA=1 refB=0, got refA=%zu refB=%zu\n",
+                refA_excl, refB_excl);
+        return 1;
+    }
+    return 0;
+}
+
 int main(void) {
+    if (test_exclude_multihit_counting() != 0) return 1;
+
     const char *ref_path = "tests/golden/ref.fa";
     const char *reads_path = "tests/golden/reads.fastq.gz";
     const char *expected_csv = "tests/golden/expected.csv";
@@ -115,7 +215,7 @@ int main(void) {
     }
     trie_write_sam_header(sam_fp, root);
 
-    rc = load_fastq(reads_path, root, map, (int)kmer_len, 0, &min_len, &max_len, 0, sam_fp, 1);
+    rc = load_fastq(reads_path, root, map, (int)kmer_len, 0, &min_len, &max_len, 0, 0, sam_fp, 0, 1);
     fclose(sam_fp);
     if (rc != 0) {
         fprintf(stderr, "ERROR: load_fastq failed (rc=%d)\n", rc);
