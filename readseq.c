@@ -115,6 +115,7 @@ typedef struct {
     int k_mm;
     int exclude_multihit;
     int sam_soft_clip;
+    int sam_emit_unmapped;
     FILE *sam_fp;
     kh_counter_t *local_counts;
     int status;
@@ -197,6 +198,7 @@ static int process_one_read(const char *read_name,
                             int k_mm,
                             int exclude_multihit,
                             int sam_soft_clip,
+                            int sam_emit_unmapped,
                             FILE *sam_fp,
                             SamChunkQueue *sam_queue,
                             int counts_preseeded) {
@@ -222,12 +224,14 @@ static int process_one_read(const char *read_name,
 
     if (hits.n == 0) {
         if (sam_out) {
-            if (sam_queue) {
-                sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len);
-            } else {
-                flockfile(sam_out);
-                sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len);
-                funlockfile(sam_out);
+            if (sam_emit_unmapped) {
+                if (sam_queue) {
+                    sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len);
+                } else {
+                    flockfile(sam_out);
+                    sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len);
+                    funlockfile(sam_out);
+                }
             }
         }
         goto cleanup;
@@ -254,12 +258,14 @@ static int process_one_read(const char *read_name,
                         sam_soft_clip);
 
     if (sam_out && kh_size(matches) == 0) {
-        if (sam_queue) {
-            sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len);
-        } else {
-            flockfile(sam_out);
-            sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len);
-            funlockfile(sam_out);
+        if (sam_emit_unmapped) {
+            if (sam_queue) {
+                sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len);
+            } else {
+                flockfile(sam_out);
+                sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len);
+                funlockfile(sam_out);
+            }
         }
     }
 
@@ -456,6 +462,7 @@ static void *fastq_worker_main(void *arg) {
                                  ctx->k_mm,
                                  ctx->exclude_multihit,
                                  ctx->sam_soft_clip,
+                                 ctx->sam_emit_unmapped,
                                  ctx->sam_fp,
                                  ctx->sam_queue,
                                  0) != 0) {
@@ -484,6 +491,7 @@ static int load_fastq_single(const char *path,
                              int k_mm,
                              int exclude_multihit,
                              int sam_soft_clip,
+                             int sam_emit_unmapped,
                              FILE *sam_fp) {
     gzFile fp = gzopen(path, "rb");
     if (fp == 0) { perror("gzopen"); return 1; }
@@ -520,6 +528,7 @@ static int load_fastq_single(const char *path,
                              k_mm,
                              exclude_multihit,
                              sam_soft_clip,
+                             sam_emit_unmapped,
                              sam_fp,
                              NULL,
                              1) != 0) {
@@ -548,6 +557,7 @@ static int load_fastq_mt(const char *path,
                          int k_mm,
                          int exclude_multihit,
                          int sam_soft_clip,
+                         int sam_emit_unmapped,
                          FILE *sam_fp,
                          unsigned threads) {
     SamChunkQueue sam_queue;
@@ -630,6 +640,7 @@ static int load_fastq_mt(const char *path,
         ctxs[i].k_mm = k_mm;
         ctxs[i].exclude_multihit = exclude_multihit;
         ctxs[i].sam_soft_clip = sam_soft_clip;
+        ctxs[i].sam_emit_unmapped = sam_emit_unmapped;
         ctxs[i].sam_fp = sam_fp;
         ctxs[i].local_counts = NULL;
         ctxs[i].status = 0;
@@ -770,13 +781,14 @@ static int load_fastq_mt(const char *path,
 int load_fastq(const char *path, TrieNode *root, kh_counter_t *counts,
                int kmerlen, int seed_mm, size_t *min_len, size_t *max_len, int k_mm,
                int exclude_multihit, FILE *sam_fp, int sam_soft_clip,
+               int sam_emit_unmapped,
                unsigned threads) {
     if (threads <= 1) {
         return load_fastq_single(path, root, counts, kmerlen, seed_mm, min_len, max_len, k_mm,
-                                 exclude_multihit, sam_soft_clip, sam_fp);
+                                 exclude_multihit, sam_soft_clip, sam_emit_unmapped, sam_fp);
     }
     return load_fastq_mt(path, root, counts, kmerlen, seed_mm, min_len, max_len, k_mm,
-                         exclude_multihit, sam_soft_clip, sam_fp, threads);
+                         exclude_multihit, sam_soft_clip, sam_emit_unmapped, sam_fp, threads);
 }
 
 

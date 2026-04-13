@@ -59,6 +59,7 @@ fastp \
 | `-o`, `--output FILE` | Output CSV path. | `counts.csv` |
 | `-s`, `--sam FILE` | Write SAM alignments. Use `-` for stdout. | off |
 | `--soft-clip` | Use soft clipping (`S`) for SAM CIGAR and keep full read in `SEQ/QUAL` for debugging; if omitted, hard clipping (`H`) is used. | off (hard clip) |
+| `--no-sam-unmapped` | Do not write unmapped reads (FLAG `4`) into SAM output. | off (unmapped reads included) |
 | `-k`, `--kmer INT` | Seed k-mer length for prefilter. Allowed: `1..12`. | `8` |
 | `--seed-mm INT` | Seed mismatches allowed. Allowed: `0` or `1`. | `0` |
 | `-m`, `--mismatch INT` | Total mismatches allowed during extension. Clamped to `0..5`; if omitted, defaults to `--seed-mm`. | `0` or `1` (inherits `--seed-mm`) |
@@ -80,6 +81,9 @@ fastp \
 
 # With SAM soft clipping (default is hard clipping if omitted)
 ./cubaTrie -r reference.fasta -i reads.fastq.gz -o counts.csv -s output.sam --soft-clip
+
+# Skip unmapped records in SAM output
+./cubaTrie -r reference.fasta -i reads.fastq.gz -o counts.csv -s output.sam --no-sam-unmapped
 
 # More sensitive seeding (allow 1 mismatch in seed and query)
 ./cubaTrie -r reference.fasta -i reads.fastq.gz -k 8 --seed-mm 1 -m 1 -o counts.csv

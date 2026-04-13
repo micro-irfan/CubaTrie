@@ -12,7 +12,7 @@ int load_reference(const char *path, TrieNode *root, kh_counter_t *map,
                    int add_revcomp, size_t *kmer_len, TrieDupPolicy dup_policy);
 int load_fastq(const char *path, TrieNode *root, kh_counter_t *counts,
                int kmerlen, int seed_mm, size_t *min_len, size_t *max_len, int k_mm,
-               int exclude_multihit, FILE *sam_fp, int sam_soft_clip, unsigned threads);
+               int exclude_multihit, FILE *sam_fp, int sam_soft_clip, int sam_emit_unmapped, unsigned threads);
 
 static int file_exists(const char *path) {
     FILE *fp = fopen(path, "rb");
@@ -94,6 +94,83 @@ static int write_test_fastq_gz(const char *path) {
     return ok;
 }
 
+static int write_test_fastq_with_unmapped_gz(const char *path) {
+    gzFile fp = gzopen(path, "wb");
+    if (!fp) return 1;
+    const char *fastq =
+        "@r_map\n"
+        "ACGTA\n"
+        "+\n"
+        "IIIII\n"
+        "@r_unmapped\n"
+        "TTTTT\n"
+        "+\n"
+        "IIIII\n";
+    int ok = (gzputs(fp, fastq) >= 0) ? 0 : 1;
+    gzclose(fp);
+    return ok;
+}
+
+static int run_sam_unmapped_case(const char *reads_path,
+                                 const char *sam_path,
+                                 int sam_emit_unmapped,
+                                 int *has_mapped_out,
+                                 int *has_unmapped_out) {
+    TrieNode *root = trie_create_node();
+    kh_counter_t *map = kh_init(counter);
+    if (!root || !map) {
+        if (root) trie_free_node(root);
+        if (map) kh_destroy(counter, map);
+        return 1;
+    }
+    if (trie_insert(root, "ACGT", "refA", 0) != TRIE_INSERT_OK) {
+        counter_free(map);
+        trie_free_node(root);
+        return 1;
+    }
+    if (counter_add_with_init(map, "refA", 0, 0) != 0) {
+        counter_free(map);
+        trie_free_node(root);
+        return 1;
+    }
+
+    FILE *sam_fp = fopen(sam_path, "w");
+    if (!sam_fp) {
+        counter_free(map);
+        trie_free_node(root);
+        return 1;
+    }
+    trie_write_sam_header(sam_fp, root);
+
+    size_t min_len = 4, max_len = 4;
+    int rc = load_fastq(reads_path, root, map, 4, 0, &min_len, &max_len, 0, 0,
+                        sam_fp, 0, sam_emit_unmapped, 1);
+    fclose(sam_fp);
+
+    if (rc != 0) {
+        counter_free(map);
+        trie_free_node(root);
+        return 1;
+    }
+
+    size_t sam_len = 0;
+    char *sam_txt = read_text_normalized(sam_path, &sam_len);
+    (void)sam_len;
+    if (!sam_txt) {
+        counter_free(map);
+        trie_free_node(root);
+        return 1;
+    }
+
+    *has_mapped_out = (strstr(sam_txt, "\t0\trefA\t1\t255\t") != NULL);
+    *has_unmapped_out = (strstr(sam_txt, "\t4\t*\t0\t0\t*\t*\t0\t0\t") != NULL);
+
+    free(sam_txt);
+    counter_free(map);
+    trie_free_node(root);
+    return 0;
+}
+
 static int run_multihit_counting_case(const char *reads_path, int exclude_multihit,
                                       size_t *refA_out, size_t *refB_out) {
     TrieNode *root = trie_create_node();
@@ -117,7 +194,7 @@ static int run_multihit_counting_case(const char *reads_path, int exclude_multih
     }
 
     size_t min_len = 4, max_len = 4;
-    int rc = load_fastq(reads_path, root, map, 4, 0, &min_len, &max_len, 0, exclude_multihit, NULL, 0, 1);
+    int rc = load_fastq(reads_path, root, map, 4, 0, &min_len, &max_len, 0, exclude_multihit, NULL, 0, 1, 1);
     if (rc != 0) {
         counter_free(map);
         trie_free_node(root);
@@ -167,8 +244,49 @@ static int test_exclude_multihit_counting(void) {
     return 0;
 }
 
+static int test_no_sam_unmapped_output(void) {
+    const char *reads_path = "tests/golden/tmp.unmapped.fastq.gz";
+    const char *sam_keep = "tests/golden/tmp.unmapped.keep.sam";
+    const char *sam_drop = "tests/golden/tmp.unmapped.drop.sam";
+
+    if (write_test_fastq_with_unmapped_gz(reads_path) != 0) {
+        fprintf(stderr, "ERROR: failed to write unmapped FASTQ fixture: %s\n", reads_path);
+        return 1;
+    }
+
+    int keep_has_mapped = 0, keep_has_unmapped = 0;
+    int drop_has_mapped = 0, drop_has_unmapped = 0;
+    int failed = 0;
+
+    if (run_sam_unmapped_case(reads_path, sam_keep, 1, &keep_has_mapped, &keep_has_unmapped) != 0) failed = 1;
+    if (run_sam_unmapped_case(reads_path, sam_drop, 0, &drop_has_mapped, &drop_has_unmapped) != 0) failed = 1;
+
+    remove(reads_path);
+    remove(sam_keep);
+    remove(sam_drop);
+
+    if (failed) {
+        fprintf(stderr, "ERROR: unmapped SAM test setup failed.\n");
+        return 1;
+    }
+    if (!keep_has_mapped || !drop_has_mapped) {
+        fprintf(stderr, "MISMATCH: expected mapped SAM records in both modes.\n");
+        return 1;
+    }
+    if (!keep_has_unmapped) {
+        fprintf(stderr, "MISMATCH: expected unmapped SAM record when sam_emit_unmapped=1.\n");
+        return 1;
+    }
+    if (drop_has_unmapped) {
+        fprintf(stderr, "MISMATCH: unexpected unmapped SAM record when sam_emit_unmapped=0.\n");
+        return 1;
+    }
+    return 0;
+}
+
 int main(void) {
     if (test_exclude_multihit_counting() != 0) return 1;
+    if (test_no_sam_unmapped_output() != 0) return 1;
 
     const char *ref_path = "tests/golden/ref.fa";
     const char *reads_path = "tests/golden/reads.fastq.gz";
@@ -215,7 +333,7 @@ int main(void) {
     }
     trie_write_sam_header(sam_fp, root);
 
-    rc = load_fastq(reads_path, root, map, (int)kmer_len, 0, &min_len, &max_len, 0, 0, sam_fp, 0, 1);
+    rc = load_fastq(reads_path, root, map, (int)kmer_len, 0, &min_len, &max_len, 0, 0, sam_fp, 0, 1, 1);
     fclose(sam_fp);
     if (rc != 0) {
         fprintf(stderr, "ERROR: load_fastq failed (rc=%d)\n", rc);

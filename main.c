@@ -11,6 +11,7 @@ typedef struct {
     const char *out;         // -o/--output  ("-" means stdout)
     const char *sam;         // --sam FILE (or "-")
     int sam_soft_clip;       // --soft-clip
+    int sam_emit_unmapped;   // --no-sam-unmapped toggles this off
     int k;                   // -k/--kmer (seed k)
     int seed_mm;             // --seed-mm
     int rc; 
@@ -30,6 +31,7 @@ static void usage(const char *prog) {
         "  -o, --output FILE       output CSV (default: counts.csv)\n"
         "  -s, --sam FILE          output SAM alignments (use \"-\" for stdout)\n"
         "      --soft-clip         use soft clipping (S) in SAM CIGAR (default: hard clip H)\n"
+        "      --no-sam-unmapped   do not emit unmapped records (FLAG 4) into SAM\n"
         "  -k, --kmer INT          seed k-mer length for prefilter [1..12] (default: 8)\n"
         "      --seed-mm INT       allowed seed mismatches [0|1] (default: 0)\n"
         "      --exclude-multihit  do not count reads with >1 reference hit\n"
@@ -59,6 +61,7 @@ int parse_args(int argc, char **argv, Options *opt, int *pos_start) {
         {"sam",       ko_required_argument, 's'},
         {"kmer",      ko_required_argument, 'k'},
         {"soft-clip", ko_no_argument,       304},
+        {"no-sam-unmapped", ko_no_argument, 305},
         {"seed-mm",   ko_required_argument, 302},
         {"exclude-multihit", ko_no_argument, 303},
         {"dup-policy",ko_required_argument, 'd'},
@@ -75,6 +78,7 @@ int parse_args(int argc, char **argv, Options *opt, int *pos_start) {
     opt->out = "counts.csv";
     opt->sam = NULL;
     opt->sam_soft_clip = 0;
+    opt->sam_emit_unmapped = 1;
     opt->k = 8;
     opt->seed_mm = 0;
     opt->rc = 1;
@@ -96,6 +100,9 @@ int parse_args(int argc, char **argv, Options *opt, int *pos_start) {
         case 'k': opt->k = atoi(o.arg); break;
         case 304:
             opt->sam_soft_clip = 1;
+            break;
+        case 305:
+            opt->sam_emit_unmapped = 0;
             break;
         case 302:
             opt->seed_mm = atoi(o.arg);
@@ -175,6 +182,7 @@ int load_fastq(const char *path,
                int exclude_multihit,
                FILE *sam_fp,
                int sam_soft_clip,
+               int sam_emit_unmapped,
                unsigned threads);
 
 
@@ -223,7 +231,7 @@ int main(int argc, char **argv) {
 
     // Find Reference in Queries
     if (load_fastq(opt.in, root, map, opt.k, opt.seed_mm, &min_len, &max_len, opt.mm,
-                   opt.exclude_multihit, sam_fp, opt.sam_soft_clip, opt.threads) != 0) {
+                   opt.exclude_multihit, sam_fp, opt.sam_soft_clip, opt.sam_emit_unmapped, opt.threads) != 0) {
         fprintf(stderr, "Failed while loading input reads.\n");
         if (sam_fp && sam_fp != stdout) fclose(sam_fp);
         counter_free(map);

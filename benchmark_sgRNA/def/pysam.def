@@ -1,0 +1,30 @@
+Bootstrap: docker
+From: python:3.9-slim
+
+%labels
+    Version v1.0
+    Description "Singularity image with Python 3.9 and pysam"
+
+%post
+    # Update and install basic build dependencies
+    apt-get update && apt-get install -y --no-install-recommends \
+        gcc \
+        libbz2-dev \
+        liblzma-dev \
+        zlib1g-dev \
+        libcurl4-openssl-dev \
+        libssl-dev \
+        procps \
+        && rm -rf /var/lib/apt/lists/*
+
+    # Install pysam (specify version if needed)
+    pip install --no-cache-dir pysam
+
+%environment
+    export PATH="/usr/local/bin:$PATH"
+    export LC_ALL=C
+    export LANG=C
+
+%runscript
+    echo "This container has Python 3.9 and pysam installed."
+    echo "Use 'singularity exec <image.sif> python' to run Python."
