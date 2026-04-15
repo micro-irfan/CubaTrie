@@ -448,6 +448,28 @@ static void *fastq_worker_main(void *arg) {
         if (pop_status == 1) break;
         if (pop_status < 0) break;
 
+        /*
+         * In MT SAM mode, aggregate a whole FASTQ batch into one memory stream
+         * before enqueueing to reduce per-read stream/queue overhead.
+         */
+        FILE *sam_batch_fp = NULL;
+        char *sam_batch_buf = NULL;
+        size_t sam_batch_len = 0;
+        FILE *sam_target_fp = ctx->sam_fp;
+        SamChunkQueue *sam_target_queue = ctx->sam_queue;
+        if (ctx->sam_queue && ctx->sam_fp) {
+            sam_batch_fp = open_memstream(&sam_batch_buf, &sam_batch_len);
+            if (!sam_batch_fp) {
+                ctx->status = 1;
+                fastq_queue_request_abort(ctx->queue);
+                sam_chunk_queue_request_abort(ctx->sam_queue);
+                free_fastq_batch(&batch);
+                break;
+            }
+            sam_target_fp = sam_batch_fp;
+            sam_target_queue = NULL;
+        }
+
         for (size_t i = 0; i < batch.n; ++i) {
             FastqTask *task = &batch.tasks[i];
             if (process_one_read(task->name,
@@ -463,13 +485,43 @@ static void *fastq_worker_main(void *arg) {
                                  ctx->exclude_multihit,
                                  ctx->sam_soft_clip,
                                  ctx->sam_emit_unmapped,
-                                 ctx->sam_fp,
-                                 ctx->sam_queue,
+                                 sam_target_fp,
+                                 sam_target_queue,
                                  0) != 0) {
                 ctx->status = 1;
                 fastq_queue_request_abort(ctx->queue);
                 if (ctx->sam_queue) sam_chunk_queue_request_abort(ctx->sam_queue);
                 break;
+            }
+        }
+
+        if (sam_batch_fp) {
+            if (ctx->status == 0 && fflush(sam_batch_fp) != 0) {
+                ctx->status = 1;
+                fastq_queue_request_abort(ctx->queue);
+                sam_chunk_queue_request_abort(ctx->sam_queue);
+            }
+            if (fclose(sam_batch_fp) != 0 && ctx->status == 0) {
+                ctx->status = 1;
+                fastq_queue_request_abort(ctx->queue);
+                sam_chunk_queue_request_abort(ctx->sam_queue);
+            }
+            sam_batch_fp = NULL;
+
+            if (sam_batch_buf) {
+                if (ctx->status == 0 && sam_batch_len > 0) {
+                    SamChunk chunk = { sam_batch_buf, sam_batch_len };
+                    if (sam_chunk_queue_push(ctx->sam_queue, &chunk) != 0) {
+                        free(sam_batch_buf);
+                        ctx->status = 1;
+                        fastq_queue_request_abort(ctx->queue);
+                        sam_chunk_queue_request_abort(ctx->sam_queue);
+                    }
+                } else {
+                    free(sam_batch_buf);
+                }
+                sam_batch_buf = NULL;
+                sam_batch_len = 0;
             }
         }
 

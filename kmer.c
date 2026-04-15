@@ -28,6 +28,7 @@ static int name_is_rev(const char *name) {
 
 typedef struct {
     const char *ref_name;
+    const char *ref_seq;
     size_t match_start;
     size_t match_len;
     int nm;
@@ -50,12 +51,32 @@ typedef struct {
 
 typedef kvec_t(CursorMatch) CursorMatchVec;
 
+static void sam_write_md_tag(FILE *sam_fp,
+                             const char *read_seq,
+                             size_t match_start,
+                             const char *ref_seq,
+                             size_t match_len) {
+    if (!sam_fp || !read_seq || !ref_seq) return;
+    fputs("\tMD:Z:", sam_fp);
+    size_t run = 0;
+    for (size_t i = 0; i < match_len; ++i) {
+        if (read_seq[match_start + i] == ref_seq[i]) {
+            run++;
+        } else {
+            fprintf(sam_fp, "%zu%c", run, ref_seq[i]);
+            run = 0;
+        }
+    }
+    fprintf(sam_fp, "%zu", run);
+}
+
 static void sam_write_alignment(FILE *sam_fp,
                                 const char *read_name,
                                 const char *read_seq,
                                 const char *read_qual,
                                 size_t read_len,
                                 const char *ref_name,
+                                const char *ref_seq,
                                 size_t match_start,
                                 size_t match_len,
                                 int nm,
@@ -100,13 +121,13 @@ static void sam_write_alignment(FILE *sam_fp,
 
     if (has_full_qual) {
         if (nh > 1) {
-            fprintf(sam_fp, "%.*s\t%d\t%.*s\t1\t255\t%s\t*\t0\t0\t%.*s\t%.*s\tNM:i:%d\tNH:i:%d\n",
+            fprintf(sam_fp, "%.*s\t%d\t%.*s\t1\t255\t%s\t*\t0\t0\t%.*s\t%.*s\tNM:i:%d\tNH:i:%d",
                     (int)qname_len, read_name, flag, (int)rname_len, ref_name, cigar,
                     (int)seq_out_len, seq_out,
                     (int)qual_out_len, qual_out,
                     nm, nh);
         } else {
-            fprintf(sam_fp, "%.*s\t%d\t%.*s\t1\t255\t%s\t*\t0\t0\t%.*s\t%.*s\tNM:i:%d\n",
+            fprintf(sam_fp, "%.*s\t%d\t%.*s\t1\t255\t%s\t*\t0\t0\t%.*s\t%.*s\tNM:i:%d",
                     (int)qname_len, read_name, flag, (int)rname_len, ref_name, cigar,
                     (int)seq_out_len, seq_out,
                     (int)qual_out_len, qual_out,
@@ -114,17 +135,19 @@ static void sam_write_alignment(FILE *sam_fp,
         }
     } else {
         if (nh > 1) {
-            fprintf(sam_fp, "%.*s\t%d\t%.*s\t1\t255\t%s\t*\t0\t0\t%.*s\t*\tNM:i:%d\tNH:i:%d\n",
+            fprintf(sam_fp, "%.*s\t%d\t%.*s\t1\t255\t%s\t*\t0\t0\t%.*s\t*\tNM:i:%d\tNH:i:%d",
                     (int)qname_len, read_name, flag, (int)rname_len, ref_name, cigar,
                     (int)seq_out_len, seq_out,
                     nm, nh);
         } else {
-            fprintf(sam_fp, "%.*s\t%d\t%.*s\t1\t255\t%s\t*\t0\t0\t%.*s\t*\tNM:i:%d\n",
+            fprintf(sam_fp, "%.*s\t%d\t%.*s\t1\t255\t%s\t*\t0\t0\t%.*s\t*\tNM:i:%d",
                     (int)qname_len, read_name, flag, (int)rname_len, ref_name, cigar,
                     (int)seq_out_len, seq_out,
                     nm);
         }
     }
+    sam_write_md_tag(sam_fp, read_seq, match_start, ref_seq, match_len);
+    fputc('\n', sam_fp);
 }
 
 // Pack text[0..n) into 2-bit words (LSB-first). Also fill ambig-mask (1 bit per base) if provided.
@@ -407,6 +430,7 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
                 if (sam_fp) {
                     SamAlignmentRecord rec = {
                         kh_key(found_sequences, jt),
+                        matches.a[m].seq,
                         h,
                         matches.a[m].seq_len,
                         matches.a[m].mm
@@ -448,6 +472,7 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
                     if (sam_fp) {
                         SamAlignmentRecord rec = {
                             kh_key(found_sequences, jt),
+                            matches.a[m].seq,
                             h,
                             matches.a[m].seq_len,
                             matches.a[m].mm
@@ -471,6 +496,7 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
                                 read_qual,
                                 seq_len,
                                 sam_records.a[i].ref_name,
+                                sam_records.a[i].ref_seq,
                                 sam_records.a[i].match_start,
                                 sam_records.a[i].match_len,
                                 sam_records.a[i].nm,
@@ -566,6 +592,7 @@ void find_matches(const char *sequence, size_t seq_len,
             if (sam_fp) {
                 SamAlignmentRecord rec = {
                     kh_key(found_sequences, jt),
+                    matches.a[m].seq,
                     abs_start,
                     strlen(matches.a[m].seq),
                     matches.a[m].mm
@@ -587,6 +614,7 @@ void find_matches(const char *sequence, size_t seq_len,
                                 read_qual,
                                 seq_len,
                                 sam_records.a[i].ref_name,
+                                sam_records.a[i].ref_seq,
                                 sam_records.a[i].match_start,
                                 sam_records.a[i].match_len,
                                 sam_records.a[i].nm,
