@@ -212,7 +212,7 @@ int main(int argc, char **argv) {
         trie_free_node(root);
         return 1;
     }
-    printf("Inserted %zu sequences (forward & reverse count)\n", n);
+    fprintf(stderr, "Inserted %zu sequences (forward & reverse count)\n", n);
 
     FILE *sam_fp = NULL;
     if (opt.sam) {
