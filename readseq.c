@@ -28,9 +28,8 @@ static char *revcomp_new_n(const char *s, size_t n) {
 
 const size_t STEP = 1000000;
 static const size_t MT_TASK_QUEUE_CAPACITY = 1024;
-static const size_t MT_READ_BATCH_TARGET_BASES = 4u * 1024u * 1024u;
+static const size_t MT_READ_BATCH_TARGET_BASES = 16u * 1024u * 1024u;
 static const size_t MT_READ_BATCH_MAX_READS = 4096;
-static const size_t MT_MERGE_COPY_BUF = 1u * 1024u * 1024u;
 
 static void sam_write_unmapped(FILE *sam_fp,
                                const char *read_name,
@@ -117,6 +116,7 @@ typedef struct {
     int sam_soft_clip;
     int sam_emit_unmapped;
     FILE *sam_fp;
+    pthread_mutex_t *sam_write_mtx;
     kh_counter_t *local_counts;
     int status;
 } FastqWorkerCtx;
@@ -158,12 +158,19 @@ static void free_sam_chunk(SamChunk *chunk) {
     chunk->len = 0;
 }
 
-static void strset_free_with_keys(khash_t(strset) *set) {
+static _Thread_local khash_t(strset) *tls_matches = NULL;
+
+static void strset_clear_with_keys(khash_t(strset) *set) {
     if (!set) return;
     for (khint_t i = kh_begin(set); i != kh_end(set); ++i) {
         if (kh_exist(set, i)) free((char*)kh_key(set, i));
     }
-    kh_destroy(strset, set);
+    kh_clear(strset, set);
+}
+
+static khash_t(strset) *tls_get_matches(void) {
+    if (!tls_matches) tls_matches = kh_init(strset);
+    return tls_matches;
 }
 
 static int merge_counter_into(kh_counter_t *dst, const kh_counter_t *src) {
@@ -231,11 +238,12 @@ static int process_one_read(const char *read_name,
         goto cleanup;
     }
 
-    matches = kh_init(strset);
+    matches = tls_get_matches();
     if (!matches) {
         status = 1;
         goto cleanup;
     }
+    strset_clear_with_keys(matches);
 
     find_matches_seeded(read_seq,
                         read_len,
@@ -267,7 +275,7 @@ static int process_one_read(const char *read_name,
     }
 
 cleanup:
-    if (matches) strset_free_with_keys(matches);
+    if (matches) strset_clear_with_keys(matches);
     kv_destroy(hits);
 
     if (sam_mem) {
@@ -426,7 +434,6 @@ static void *fastq_worker_main(void *arg) {
     if (!ctx->local_counts) {
         ctx->status = 1;
         fastq_queue_request_abort(ctx->queue);
-        if (ctx->sam_queue) sam_chunk_queue_request_abort(ctx->sam_queue);
         return NULL;
     }
 
@@ -435,6 +442,23 @@ static void *fastq_worker_main(void *arg) {
         int pop_status = fastq_queue_pop(ctx->queue, &batch);
         if (pop_status == 1) break;
         if (pop_status < 0) break;
+
+        FILE *sam_batch_fp = NULL;
+        char *sam_batch_buf = NULL;
+        size_t sam_batch_len = 0;
+        FILE *sam_target_fp = ctx->sam_fp;
+        SamChunkQueue *sam_target_queue = ctx->sam_queue;
+        if (ctx->sam_fp && ctx->sam_write_mtx) {
+            sam_batch_fp = open_memstream(&sam_batch_buf, &sam_batch_len);
+            if (!sam_batch_fp) {
+                ctx->status = 1;
+                fastq_queue_request_abort(ctx->queue);
+                free_fastq_batch(&batch);
+                break;
+            }
+            sam_target_fp = sam_batch_fp;
+            sam_target_queue = NULL;
+        }
 
         for (size_t i = 0; i < batch.n; ++i) {
             FastqTask *task = &batch.tasks[i];
@@ -451,13 +475,38 @@ static void *fastq_worker_main(void *arg) {
                                  ctx->exclude_multihit,
                                  ctx->sam_soft_clip,
                                  ctx->sam_emit_unmapped,
-                                 ctx->sam_fp,
-                                 ctx->sam_queue,
+                                 sam_target_fp,
+                                 sam_target_queue,
                                  0) != 0) {
                 ctx->status = 1;
                 fastq_queue_request_abort(ctx->queue);
-                if (ctx->sam_queue) sam_chunk_queue_request_abort(ctx->sam_queue);
                 break;
+            }
+        }
+
+        if (sam_batch_fp) {
+            if (ctx->status == 0 && fflush(sam_batch_fp) != 0) {
+                ctx->status = 1;
+                fastq_queue_request_abort(ctx->queue);
+            }
+            if (fclose(sam_batch_fp) != 0 && ctx->status == 0) {
+                ctx->status = 1;
+                fastq_queue_request_abort(ctx->queue);
+            }
+            sam_batch_fp = NULL;
+            if (sam_batch_buf) {
+                if (ctx->status == 0 && sam_batch_len > 0) {
+                    pthread_mutex_lock(ctx->sam_write_mtx);
+                    size_t wrote = fwrite(sam_batch_buf, 1, sam_batch_len, ctx->sam_fp);
+                    pthread_mutex_unlock(ctx->sam_write_mtx);
+                    if (wrote != sam_batch_len) {
+                        ctx->status = 1;
+                        fastq_queue_request_abort(ctx->queue);
+                    }
+                }
+                free(sam_batch_buf);
+                sam_batch_buf = NULL;
+                sam_batch_len = 0;
             }
         }
 
@@ -549,7 +598,8 @@ static int load_fastq_mt(const char *path,
                          FILE *sam_fp,
                          unsigned threads) {
     int use_sam_output = (sam_fp != NULL);
-    FILE **sam_shards = NULL;
+    pthread_mutex_t sam_write_mtx;
+    int sam_write_mtx_init = 0;
 
     gzFile fp = gzopen(path, "rb");
     if (fp == 0) { perror("gzopen"); return 1; }
@@ -572,43 +622,21 @@ static int load_fastq_mt(const char *path,
         return 1;
     }
 
-    if (use_sam_output) {
-        sam_shards = (FILE**)calloc(threads, sizeof(*sam_shards));
-        if (!sam_shards) {
-            kmer_bitset_destroy(seed_index);
-            fastq_queue_destroy(&queue);
-            kseq_destroy(ks);
-            gzclose(fp);
-            return 1;
-        }
-        for (size_t i = 0; i < threads; ++i) {
-            sam_shards[i] = tmpfile();
-            if (!sam_shards[i]) {
-                for (size_t j = 0; j < i; ++j) {
-                    fclose(sam_shards[j]);
-                }
-                free(sam_shards);
-                kmer_bitset_destroy(seed_index);
-                fastq_queue_destroy(&queue);
-                kseq_destroy(ks);
-                gzclose(fp);
-                return 1;
-            }
-            setvbuf(sam_shards[i], NULL, _IOFBF, 16 * 1024 * 1024);
-        }
+    if (use_sam_output && pthread_mutex_init(&sam_write_mtx, NULL) != 0) {
+        kmer_bitset_destroy(seed_index);
+        fastq_queue_destroy(&queue);
+        kseq_destroy(ks);
+        gzclose(fp);
+        return 1;
     }
+    sam_write_mtx_init = use_sam_output ? 1 : 0;
 
     pthread_t *tids = (pthread_t*)calloc(threads, sizeof(*tids));
     FastqWorkerCtx *ctxs = (FastqWorkerCtx*)calloc(threads, sizeof(*ctxs));
     if (!tids || !ctxs) {
         free(tids);
         free(ctxs);
-        if (sam_shards) {
-            for (size_t i = 0; i < threads; ++i) {
-                if (sam_shards[i]) fclose(sam_shards[i]);
-            }
-            free(sam_shards);
-        }
+        if (sam_write_mtx_init) pthread_mutex_destroy(&sam_write_mtx);
         kmer_bitset_destroy(seed_index);
         fastq_queue_destroy(&queue);
         kseq_destroy(ks);
@@ -629,7 +657,8 @@ static int load_fastq_mt(const char *path,
         ctxs[i].exclude_multihit = exclude_multihit;
         ctxs[i].sam_soft_clip = sam_soft_clip;
         ctxs[i].sam_emit_unmapped = sam_emit_unmapped;
-        ctxs[i].sam_fp = use_sam_output ? sam_shards[i] : NULL;
+        ctxs[i].sam_fp = use_sam_output ? sam_fp : NULL;
+        ctxs[i].sam_write_mtx = use_sam_output ? &sam_write_mtx : NULL;
         ctxs[i].local_counts = NULL;
         ctxs[i].status = 0;
         if (pthread_create(&tids[i], NULL, fastq_worker_main, &ctxs[i]) != 0) {
@@ -734,32 +763,8 @@ static int load_fastq_mt(const char *path,
         }
     }
 
-    if (status == 0 && use_sam_output) {
-        char *copy_buf = (char*)malloc(MT_MERGE_COPY_BUF);
-        if (!copy_buf) {
-            status = 1;
-        } else {
-            for (size_t i = 0; i < started && status == 0; ++i) {
-                FILE *shard = sam_shards[i];
-                if (!shard) continue;
-                if (fflush(shard) != 0 || fseek(shard, 0, SEEK_SET) != 0) {
-                    status = 1;
-                    break;
-                }
-                for (;;) {
-                    size_t nr = fread(copy_buf, 1, MT_MERGE_COPY_BUF, shard);
-                    if (nr > 0 && fwrite(copy_buf, 1, nr, sam_fp) != nr) {
-                        status = 1;
-                        break;
-                    }
-                    if (nr == 0) {
-                        if (ferror(shard)) status = 1;
-                        break;
-                    }
-                }
-            }
-            free(copy_buf);
-        }
+    if (status == 0 && use_sam_output && fflush(sam_fp) != 0) {
+        status = 1;
     }
 
     if (status == 0) total_hits(counts, nreads);
@@ -770,12 +775,7 @@ static int load_fastq_mt(const char *path,
 
     free(tids);
     free(ctxs);
-    if (sam_shards) {
-        for (size_t i = 0; i < threads; ++i) {
-            if (sam_shards[i]) fclose(sam_shards[i]);
-        }
-        free(sam_shards);
-    }
+    if (sam_write_mtx_init) pthread_mutex_destroy(&sam_write_mtx);
     kmer_bitset_destroy(seed_index);
     fastq_queue_destroy(&queue);
     kseq_destroy(ks);

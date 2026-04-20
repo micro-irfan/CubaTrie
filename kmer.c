@@ -41,6 +41,7 @@ typedef struct {
 } SamTextBuf;
 
 static _Thread_local SamTextBuf tls_sam_text_buf = {0};
+static _Thread_local khash_t(posset) *tls_start_pos_cache = NULL;
 
 static int sam_buf_reserve(SamTextBuf *b, size_t extra) {
     if (!b) return -1;
@@ -104,6 +105,30 @@ static int sam_buf_flush(FILE *fp, const SamTextBuf *b) {
     return fwrite(b->data, 1, b->len, fp) == b->len ? 0 : -1;
 }
 
+static khash_t(posset) *tls_get_start_pos_cache(void) {
+    if (!tls_start_pos_cache) tls_start_pos_cache = kh_init(posset);
+    return tls_start_pos_cache;
+}
+
+static int sam_write_cigar(SamTextBuf *sam_buf,
+                           size_t clip_start,
+                           size_t match_len,
+                           size_t clip_end,
+                           int sam_soft_clip) {
+    char clip_op = sam_soft_clip ? 'S' : 'H';
+    if (clip_start > 0) {
+        if (sam_buf_append_size(sam_buf, clip_start) != 0) return -1;
+        if (sam_buf_append_char(sam_buf, clip_op) != 0) return -1;
+    }
+    if (sam_buf_append_size(sam_buf, match_len) != 0) return -1;
+    if (sam_buf_append_char(sam_buf, 'M') != 0) return -1;
+    if (clip_end > 0) {
+        if (sam_buf_append_size(sam_buf, clip_end) != 0) return -1;
+        if (sam_buf_append_char(sam_buf, clip_op) != 0) return -1;
+    }
+    return 0;
+}
+
 struct TrieCursorState {
     const TrieNode *node;
     uint8_t edge_idx;
@@ -161,18 +186,6 @@ static int sam_write_alignment(SamTextBuf *sam_buf,
 
     size_t clip_start = match_start;
     size_t clip_end = read_len - match_start - match_len;
-    char cigar[96];
-    char clip_op = sam_soft_clip ? 'S' : 'H';
-
-    if (clip_start > 0 && clip_end > 0) {
-        snprintf(cigar, sizeof(cigar), "%zu%c%zuM%zu%c", clip_start, clip_op, match_len, clip_end, clip_op);
-    } else if (clip_start > 0) {
-        snprintf(cigar, sizeof(cigar), "%zu%c%zuM", clip_start, clip_op, match_len);
-    } else if (clip_end > 0) {
-        snprintf(cigar, sizeof(cigar), "%zuM%zu%c", match_len, clip_end, clip_op);
-    } else {
-        snprintf(cigar, sizeof(cigar), "%zuM", match_len);
-    }
 
     int flag = name_is_rev(ref_name) ? 16 : 0;
     size_t qname_len = name_len_no_rc_suffix(read_name);
@@ -196,7 +209,7 @@ static int sam_write_alignment(SamTextBuf *sam_buf,
     if (sam_buf_append_char(sam_buf, '\t') != 0) return -1;
     if (sam_buf_append_mem(sam_buf, ref_name, rname_len) != 0) return -1;
     if (sam_buf_append_cstr(sam_buf, "\t1\t255\t") != 0) return -1;
-    if (sam_buf_append_cstr(sam_buf, cigar) != 0) return -1;
+    if (sam_write_cigar(sam_buf, clip_start, match_len, clip_end, sam_soft_clip) != 0) return -1;
     if (sam_buf_append_cstr(sam_buf, "\t*\t0\t0\t") != 0) return -1;
     if (sam_buf_append_mem(sam_buf, seq_out, seq_out_len) != 0) return -1;
     if (sam_buf_append_char(sam_buf, '\t') != 0) return -1;
@@ -461,7 +474,9 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
     if (seed_mm < 0) seed_mm = 0;
     if (seed_mm > 1) seed_mm = 1;
 
-    khash_t(posset) *start_pos_cache = kh_init(posset); // dedupe absolute start positions
+    khash_t(posset) *start_pos_cache = tls_get_start_pos_cache(); // dedupe absolute start positions
+    if (!start_pos_cache) return;
+    kh_clear(posset, start_pos_cache);
     CursorMatchVec matches; kv_init(matches);
     kvec_t(SamAlignmentRecord) sam_records; kv_init(sam_records);
 
@@ -584,7 +599,6 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
 
     kv_destroy(matches);
     kv_destroy(sam_records);
-    kh_destroy(posset, start_pos_cache);
 }
 
 
@@ -620,7 +634,9 @@ void find_matches(const char *sequence, size_t seq_len,
                   FILE *sam_fp,
                   int sam_soft_clip)
 {
-    khash_t(posset) *start_pos_cache = kh_init(posset);   // dedupe absolute start positions
+    khash_t(posset) *start_pos_cache = tls_get_start_pos_cache();   // dedupe absolute start positions
+    if (!start_pos_cache) return;
+    kh_clear(posset, start_pos_cache);
     kFoundVec matches; kv_init(matches);
     kvec_t(SamAlignmentRecord) sam_records; kv_init(sam_records);
 
@@ -712,5 +728,4 @@ void find_matches(const char *sequence, size_t seq_len,
 
     kv_destroy(sam_records);
     mv_free(&matches);
-    kh_destroy(posset, start_pos_cache);
 }
