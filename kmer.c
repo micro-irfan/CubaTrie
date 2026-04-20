@@ -40,6 +40,8 @@ typedef struct {
     size_t cap;
 } SamTextBuf;
 
+static _Thread_local SamTextBuf tls_sam_text_buf = {0};
+
 static int sam_buf_reserve(SamTextBuf *b, size_t extra) {
     if (!b) return -1;
     if (extra > ((size_t)-1) - b->len) return -1;
@@ -553,10 +555,11 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
     if (sam_fp && sam_records.n > 0) {
         int nh = (int)sam_records.n;
         int has_full_qual = (read_qual && strlen(read_qual) == seq_len);
-        SamTextBuf sam_buf = {0};
+        SamTextBuf *sam_buf = &tls_sam_text_buf;
+        sam_buf->len = 0;
         int write_status = 0;
         for (size_t i = 0; i < sam_records.n; ++i) {
-            if (sam_write_alignment(&sam_buf,
+            if (sam_write_alignment(sam_buf,
                                     read_name,
                                     sequence,
                                     read_qual,
@@ -573,11 +576,10 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
                 break;
             }
         }
-        if (write_status == 0 && sam_buf_flush(sam_fp, &sam_buf) != 0) {
+        if (write_status == 0 && sam_buf_flush(sam_fp, sam_buf) != 0) {
             write_status = 1;
         }
         (void)write_status;
-        free(sam_buf.data);
     }
 
     kv_destroy(matches);
@@ -681,10 +683,11 @@ void find_matches(const char *sequence, size_t seq_len,
     if (sam_fp && sam_records.n > 0) {
         int nh = (int)sam_records.n;
         int has_full_qual = (read_qual && strlen(read_qual) == seq_len);
-        SamTextBuf sam_buf = {0};
+        SamTextBuf *sam_buf = &tls_sam_text_buf;
+        sam_buf->len = 0;
         int write_status = 0;
         for (size_t i = 0; i < sam_records.n; ++i) {
-            if (sam_write_alignment(&sam_buf,
+            if (sam_write_alignment(sam_buf,
                                     read_name,
                                     sequence,
                                     read_qual,
@@ -701,11 +704,10 @@ void find_matches(const char *sequence, size_t seq_len,
                 break;
             }
         }
-        if (write_status == 0 && sam_buf_flush(sam_fp, &sam_buf) != 0) {
+        if (write_status == 0 && sam_buf_flush(sam_fp, sam_buf) != 0) {
             write_status = 1;
         }
         (void)write_status;
-        free(sam_buf.data);
     }
 
     kv_destroy(sam_records);
