@@ -225,13 +225,7 @@ static int process_one_read(const char *read_name,
     if (hits.n == 0) {
         if (sam_out) {
             if (sam_emit_unmapped) {
-                if (sam_queue) {
-                    sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len);
-                } else {
-                    flockfile(sam_out);
-                    sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len);
-                    funlockfile(sam_out);
-                }
+                sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len);
             }
         }
         goto cleanup;
@@ -259,13 +253,7 @@ static int process_one_read(const char *read_name,
 
     if (sam_out && kh_size(matches) == 0) {
         if (sam_emit_unmapped) {
-            if (sam_queue) {
-                sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len);
-            } else {
-                flockfile(sam_out);
-                sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len);
-                funlockfile(sam_out);
-            }
+            sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len);
         }
     }
 

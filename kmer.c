@@ -34,6 +34,74 @@ typedef struct {
     int nm;
 } SamAlignmentRecord;
 
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} SamTextBuf;
+
+static int sam_buf_reserve(SamTextBuf *b, size_t extra) {
+    if (!b) return -1;
+    if (extra > ((size_t)-1) - b->len) return -1;
+    size_t needed = b->len + extra;
+    if (needed <= b->cap) return 0;
+
+    size_t new_cap = b->cap ? b->cap : 512;
+    while (new_cap < needed) {
+        if (new_cap > ((size_t)-1) / 2) {
+            new_cap = needed;
+            break;
+        }
+        new_cap <<= 1;
+    }
+    char *p = (char*)realloc(b->data, new_cap);
+    if (!p) return -1;
+    b->data = p;
+    b->cap = new_cap;
+    return 0;
+}
+
+static int sam_buf_append_mem(SamTextBuf *b, const char *s, size_t n) {
+    if (n == 0) return 0;
+    if (!b || !s) return -1;
+    if (sam_buf_reserve(b, n) != 0) return -1;
+    memcpy(b->data + b->len, s, n);
+    b->len += n;
+    return 0;
+}
+
+static int sam_buf_append_cstr(SamTextBuf *b, const char *s) {
+    if (!s) return -1;
+    return sam_buf_append_mem(b, s, strlen(s));
+}
+
+static int sam_buf_append_char(SamTextBuf *b, char c) {
+    if (sam_buf_reserve(b, 1) != 0) return -1;
+    b->data[b->len++] = c;
+    return 0;
+}
+
+static int sam_buf_append_size(SamTextBuf *b, size_t v) {
+    char tmp[32];
+    size_t n = 0;
+    do {
+        tmp[n++] = (char)('0' + (v % 10));
+        v /= 10;
+    } while (v > 0);
+    if (sam_buf_reserve(b, n) != 0) return -1;
+    for (size_t i = 0; i < n; ++i) {
+        b->data[b->len + i] = tmp[n - 1 - i];
+    }
+    b->len += n;
+    return 0;
+}
+
+static int sam_buf_flush(FILE *fp, const SamTextBuf *b) {
+    if (!fp || !b) return -1;
+    if (b->len == 0) return 0;
+    return fwrite(b->data, 1, b->len, fp) == b->len ? 0 : -1;
+}
+
 struct TrieCursorState {
     const TrieNode *node;
     uint8_t edge_idx;
@@ -51,41 +119,43 @@ typedef struct {
 
 typedef kvec_t(CursorMatch) CursorMatchVec;
 
-static void sam_write_md_tag(FILE *sam_fp,
-                             const char *read_seq,
-                             size_t match_start,
-                             const char *ref_seq,
-                             size_t match_len) {
-    if (!sam_fp || !read_seq || !ref_seq) return;
-    fputs("\tMD:Z:", sam_fp);
+static int sam_write_md_tag(SamTextBuf *sam_buf,
+                            const char *read_seq,
+                            size_t match_start,
+                            const char *ref_seq,
+                            size_t match_len) {
+    if (!sam_buf || !read_seq || !ref_seq) return -1;
+    if (sam_buf_append_cstr(sam_buf, "\tMD:Z:") != 0) return -1;
     size_t run = 0;
     for (size_t i = 0; i < match_len; ++i) {
         if (read_seq[match_start + i] == ref_seq[i]) {
             run++;
         } else {
-            fprintf(sam_fp, "%zu%c", run, ref_seq[i]);
+            if (sam_buf_append_size(sam_buf, run) != 0) return -1;
+            if (sam_buf_append_char(sam_buf, ref_seq[i]) != 0) return -1;
             run = 0;
         }
     }
-    fprintf(sam_fp, "%zu", run);
+    return sam_buf_append_size(sam_buf, run);
 }
 
-static void sam_write_alignment(FILE *sam_fp,
-                                const char *read_name,
-                                const char *read_seq,
-                                const char *read_qual,
-                                size_t read_len,
-                                const char *ref_name,
-                                const char *ref_seq,
-                                size_t match_start,
-                                size_t match_len,
-                                int nm,
-                                int nh,
-                                int sam_soft_clip) {
-    if (!sam_fp || !read_name || !read_seq || !ref_name) return;
-    if (match_start >= read_len) return;
+static int sam_write_alignment(SamTextBuf *sam_buf,
+                               const char *read_name,
+                               const char *read_seq,
+                               const char *read_qual,
+                               size_t read_len,
+                               const char *ref_name,
+                               const char *ref_seq,
+                               size_t match_start,
+                               size_t match_len,
+                               int nm,
+                               int nh,
+                               int sam_soft_clip,
+                               int has_full_qual) {
+    if (!sam_buf || !read_name || !read_seq || !ref_name) return -1;
+    if (match_start >= read_len) return 0;
     if (match_len > read_len - match_start) match_len = read_len - match_start;
-    if (match_len == 0) return;
+    if (match_len == 0) return 0;
 
     size_t clip_start = match_start;
     size_t clip_end = read_len - match_start - match_len;
@@ -103,7 +173,6 @@ static void sam_write_alignment(FILE *sam_fp,
     }
 
     int flag = name_is_rev(ref_name) ? 16 : 0;
-    int has_full_qual = (read_qual && strlen(read_qual) == read_len);
     size_t qname_len = name_len_no_rc_suffix(read_name);
     size_t rname_len = name_len_no_rc_suffix(ref_name);
 
@@ -119,35 +188,30 @@ static void sam_write_alignment(FILE *sam_fp,
         qual_out_len = match_len;
     }
 
+    if (sam_buf_append_mem(sam_buf, read_name, qname_len) != 0) return -1;
+    if (sam_buf_append_char(sam_buf, '\t') != 0) return -1;
+    if (sam_buf_append_size(sam_buf, (size_t)flag) != 0) return -1;
+    if (sam_buf_append_char(sam_buf, '\t') != 0) return -1;
+    if (sam_buf_append_mem(sam_buf, ref_name, rname_len) != 0) return -1;
+    if (sam_buf_append_cstr(sam_buf, "\t1\t255\t") != 0) return -1;
+    if (sam_buf_append_cstr(sam_buf, cigar) != 0) return -1;
+    if (sam_buf_append_cstr(sam_buf, "\t*\t0\t0\t") != 0) return -1;
+    if (sam_buf_append_mem(sam_buf, seq_out, seq_out_len) != 0) return -1;
+    if (sam_buf_append_char(sam_buf, '\t') != 0) return -1;
     if (has_full_qual) {
-        if (nh > 1) {
-            fprintf(sam_fp, "%.*s\t%d\t%.*s\t1\t255\t%s\t*\t0\t0\t%.*s\t%.*s\tNM:i:%d\tNH:i:%d",
-                    (int)qname_len, read_name, flag, (int)rname_len, ref_name, cigar,
-                    (int)seq_out_len, seq_out,
-                    (int)qual_out_len, qual_out,
-                    nm, nh);
-        } else {
-            fprintf(sam_fp, "%.*s\t%d\t%.*s\t1\t255\t%s\t*\t0\t0\t%.*s\t%.*s\tNM:i:%d",
-                    (int)qname_len, read_name, flag, (int)rname_len, ref_name, cigar,
-                    (int)seq_out_len, seq_out,
-                    (int)qual_out_len, qual_out,
-                    nm);
-        }
+        if (sam_buf_append_mem(sam_buf, qual_out, qual_out_len) != 0) return -1;
     } else {
-        if (nh > 1) {
-            fprintf(sam_fp, "%.*s\t%d\t%.*s\t1\t255\t%s\t*\t0\t0\t%.*s\t*\tNM:i:%d\tNH:i:%d",
-                    (int)qname_len, read_name, flag, (int)rname_len, ref_name, cigar,
-                    (int)seq_out_len, seq_out,
-                    nm, nh);
-        } else {
-            fprintf(sam_fp, "%.*s\t%d\t%.*s\t1\t255\t%s\t*\t0\t0\t%.*s\t*\tNM:i:%d",
-                    (int)qname_len, read_name, flag, (int)rname_len, ref_name, cigar,
-                    (int)seq_out_len, seq_out,
-                    nm);
-        }
+        if (sam_buf_append_char(sam_buf, '*') != 0) return -1;
     }
-    sam_write_md_tag(sam_fp, read_seq, match_start, ref_seq, match_len);
-    fputc('\n', sam_fp);
+    if (sam_buf_append_cstr(sam_buf, "\tNM:i:") != 0) return -1;
+    if (sam_buf_append_size(sam_buf, (size_t)nm) != 0) return -1;
+    if (nh > 1) {
+        if (sam_buf_append_cstr(sam_buf, "\tNH:i:") != 0) return -1;
+        if (sam_buf_append_size(sam_buf, (size_t)nh) != 0) return -1;
+    }
+    if (sam_write_md_tag(sam_buf, read_seq, match_start, ref_seq, match_len) != 0) return -1;
+    if (sam_buf_append_char(sam_buf, '\n') != 0) return -1;
+    return 0;
 }
 
 // Pack text[0..n) into 2-bit words (LSB-first). Also fill ambig-mask (1 bit per base) if provided.
@@ -488,22 +552,32 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
 
     if (sam_fp && sam_records.n > 0) {
         int nh = (int)sam_records.n;
-        flockfile(sam_fp);
+        int has_full_qual = (read_qual && strlen(read_qual) == seq_len);
+        SamTextBuf sam_buf = {0};
+        int write_status = 0;
         for (size_t i = 0; i < sam_records.n; ++i) {
-            sam_write_alignment(sam_fp,
-                                read_name,
-                                sequence,
-                                read_qual,
-                                seq_len,
-                                sam_records.a[i].ref_name,
-                                sam_records.a[i].ref_seq,
-                                sam_records.a[i].match_start,
-                                sam_records.a[i].match_len,
-                                sam_records.a[i].nm,
-                                nh,
-                                sam_soft_clip);
+            if (sam_write_alignment(&sam_buf,
+                                    read_name,
+                                    sequence,
+                                    read_qual,
+                                    seq_len,
+                                    sam_records.a[i].ref_name,
+                                    sam_records.a[i].ref_seq,
+                                    sam_records.a[i].match_start,
+                                    sam_records.a[i].match_len,
+                                    sam_records.a[i].nm,
+                                    nh,
+                                    sam_soft_clip,
+                                    has_full_qual) != 0) {
+                write_status = 1;
+                break;
+            }
         }
-        funlockfile(sam_fp);
+        if (write_status == 0 && sam_buf_flush(sam_fp, &sam_buf) != 0) {
+            write_status = 1;
+        }
+        (void)write_status;
+        free(sam_buf.data);
     }
 
     kv_destroy(matches);
@@ -606,22 +680,32 @@ void find_matches(const char *sequence, size_t seq_len,
 
     if (sam_fp && sam_records.n > 0) {
         int nh = (int)sam_records.n;
-        flockfile(sam_fp);
+        int has_full_qual = (read_qual && strlen(read_qual) == seq_len);
+        SamTextBuf sam_buf = {0};
+        int write_status = 0;
         for (size_t i = 0; i < sam_records.n; ++i) {
-            sam_write_alignment(sam_fp,
-                                read_name,
-                                sequence,
-                                read_qual,
-                                seq_len,
-                                sam_records.a[i].ref_name,
-                                sam_records.a[i].ref_seq,
-                                sam_records.a[i].match_start,
-                                sam_records.a[i].match_len,
-                                sam_records.a[i].nm,
-                                nh,
-                                sam_soft_clip);
+            if (sam_write_alignment(&sam_buf,
+                                    read_name,
+                                    sequence,
+                                    read_qual,
+                                    seq_len,
+                                    sam_records.a[i].ref_name,
+                                    sam_records.a[i].ref_seq,
+                                    sam_records.a[i].match_start,
+                                    sam_records.a[i].match_len,
+                                    sam_records.a[i].nm,
+                                    nh,
+                                    sam_soft_clip,
+                                    has_full_qual) != 0) {
+                write_status = 1;
+                break;
+            }
         }
-        funlockfile(sam_fp);
+        if (write_status == 0 && sam_buf_flush(sam_fp, &sam_buf) != 0) {
+            write_status = 1;
+        }
+        (void)write_status;
+        free(sam_buf.data);
     }
 
     kv_destroy(sam_records);

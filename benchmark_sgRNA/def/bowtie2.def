@@ -1,0 +1,36 @@
+Bootstrap: docker
+From: python:3.12-slim
+
+%post
+    set -eux
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        bowtie2 \
+        samtools \
+        fastqc \
+        pigz \
+        git \
+        ca-certificates \
+        build-essential
+
+    pip install --no-cache-dir \
+        numpy \
+        pandas \
+        matplotlib \
+        seaborn \
+        scipy \
+        scikit-learn \
+        tqdm \
+        pysam
+
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+
+%environment
+    export LC_ALL=C
+    export LANG=C
+    export MPLCONFIGDIR=/tmp/matplotlib
+
+%runscript
+    exec python "$@"

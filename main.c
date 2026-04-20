@@ -223,9 +223,7 @@ int main(int argc, char **argv) {
             trie_free_node(root);
             return 1;
         }
-        if (sam_fp != stdout) {
-            setvbuf(sam_fp, NULL, _IOFBF, 8 * 1024 * 1024);
-        }
+        setvbuf(sam_fp, NULL, _IOFBF, 16 * 1024 * 1024);
         trie_write_sam_header(sam_fp, root);
     }
 
