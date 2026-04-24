@@ -144,8 +144,8 @@ int parse_args(int argc, char **argv, Options *opt, int *pos_start) {
     }
 
     *pos_start = o.ind; // first positional argument (if any)
-    if (opt->k <= 0 || opt->k > 12) {
-        fprintf(stderr, "Invalid k-mer seed length. Allowed range: 1..12\n"); usage(argv[0]); return -4;
+    if (opt->k <= 3 || opt->k > 12) {
+        fprintf(stderr, "Invalid k-mer seed length. Allowed range: 4..12\n"); usage(argv[0]); return -4;
     }
     if (!mm_explicit) {
         // If -m/--mismatch is omitted, inherit seed mismatch allowance.
