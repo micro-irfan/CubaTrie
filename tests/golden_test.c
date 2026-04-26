@@ -5,14 +5,7 @@
 
 #include "../trie.h"
 #include "../utils.h"
-
-// readseq.c entry points
-int load_reference(const char *path, TrieNode *root, kh_counter_t *map,
-                   size_t *min_out, size_t *max_out, size_t *n_out,
-                   int add_revcomp, size_t *kmer_len, TrieDupPolicy dup_policy);
-int load_fastq(const char *path, TrieNode *root, kh_counter_t *counts,
-               int kmerlen, int seed_mm, size_t *min_len, size_t *max_len, int k_mm,
-               int exclude_multihit, FILE *sam_fp, int sam_soft_clip, int sam_emit_unmapped, unsigned threads);
+#include "../readseq.h"
 
 static int file_exists(const char *path) {
     FILE *fp = fopen(path, "rb");
@@ -144,7 +137,7 @@ static int run_sam_unmapped_case(const char *reads_path,
 
     size_t min_len = 4, max_len = 4;
     int rc = load_fastq(reads_path, root, map, 4, 0, &min_len, &max_len, 0, 0,
-                        sam_fp, 0, sam_emit_unmapped, 1);
+                        sam_fp, 0, sam_emit_unmapped, 1, NULL);
     fclose(sam_fp);
 
     if (rc != 0) {
@@ -194,7 +187,7 @@ static int run_multihit_counting_case(const char *reads_path, int exclude_multih
     }
 
     size_t min_len = 4, max_len = 4;
-    int rc = load_fastq(reads_path, root, map, 4, 0, &min_len, &max_len, 0, exclude_multihit, NULL, 0, 1, 1);
+    int rc = load_fastq(reads_path, root, map, 4, 0, &min_len, &max_len, 0, exclude_multihit, NULL, 0, 1, 1, NULL);
     if (rc != 0) {
         counter_free(map);
         trie_free_node(root);
@@ -333,7 +326,7 @@ int main(void) {
     }
     trie_write_sam_header(sam_fp, root);
 
-    rc = load_fastq(reads_path, root, map, (int)kmer_len, 0, &min_len, &max_len, 0, 0, sam_fp, 0, 1, 1);
+    rc = load_fastq(reads_path, root, map, (int)kmer_len, 0, &min_len, &max_len, 0, 0, sam_fp, 0, 1, 1, NULL);
     fclose(sam_fp);
     if (rc != 0) {
         fprintf(stderr, "ERROR: load_fastq failed (rc=%d)\n", rc);

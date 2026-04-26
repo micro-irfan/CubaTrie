@@ -5,6 +5,7 @@
 
 #include "../trie.h"
 #include "../kmer.h"
+#include "../readseq_anchor.h"
 #include "../utils.h"
 
 static char *read_tmpfile_all(FILE *fp) {
@@ -263,6 +264,147 @@ static void test_sam_header_strip_and_dedupe(void) {
     trie_free_node(root);
 }
 
+static void test_anchor_extract_window_variants(void) {
+    AnchorConfig cfg = {0};
+    AnchorRuntime ar = {0};
+    size_t start = 0, len = 0;
+
+    assert(anchor_runtime_init_range(&ar, &cfg, 3, 3) == 0); // disabled config is a no-op
+    assert(anchor_extract_window_range(&ar, "ACGT", 4, &start, &len) == -1);
+
+    cfg.enabled = 1;
+    cfg.anchor5 = "AGTC";
+    cfg.anchor3 = "TCCA";
+    cfg.max_error = 0;
+
+    assert(anchor_runtime_init_range(&ar, &cfg, 3, 3) == 0);
+
+    // Forward orientation: anchor5 ... payload ... anchor3.
+    assert(anchor_extract_window_range(&ar, "CCAGTCGATTCCAGG", 15, &start, &len) == 0);
+    assert(start == 6);
+    assert(len == 3);
+    assert(strncmp("CCAGTCGATTCCAGG" + start, "GAT", len) == 0);
+    assert(anchor_extract_window(&ar, "CCAGTCGATTCCAGG", 15, &start, &len) == 0);
+    assert(start == 6);
+    assert(len == 3);
+
+    // Reverse-complement orientation: anchor3_rc ... payload ... anchor5_rc.
+    assert(anchor_extract_window_range(&ar, "AATGGACATGACTCC", 15, &start, &len) == 0);
+    assert(start == 6);
+    assert(len == 3);
+    assert(strncmp("AATGGACATGACTCC" + start, "CAT", len) == 0);
+
+    // Ambiguous: repeated 5' anchor should be rejected.
+    assert(anchor_extract_window_range(&ar, "AGTCAAAGTCTCCA", 14, &start, &len) == 1);
+
+    cfg.anchor3 = NULL;
+    assert(anchor_runtime_init_range(&ar, &cfg, 4, 4) == 0);
+    assert(anchor_extract_window_range(&ar, "TTAGTCGGGG", 10, &start, &len) == 0);
+    assert(start == 6);
+    assert(len == 4);
+    assert(strncmp("TTAGTCGGGG" + start, "GGGG", len) == 0);
+    // With fixed-length mode (min==max), one-sided 5' takes exactly that many nt after anchor.
+    assert(anchor_extract_window_range(&ar, "TTAGTCGGGGAAAA", 14, &start, &len) == 0);
+    assert(start == 6);
+    assert(len == 4);
+    assert(strncmp("TTAGTCGGGGAAAA" + start, "GGGG", len) == 0);
+
+    cfg.anchor5 = NULL;
+    cfg.anchor3 = "TCCA";
+    assert(anchor_runtime_init_range(&ar, &cfg, 4, 4) == 0);
+    assert(anchor_extract_window_range(&ar, "GGGGTCCAAA", 10, &start, &len) == 0);
+    assert(start == 0);
+    assert(len == 4);
+    assert(strncmp("GGGGTCCAAA" + start, "GGGG", len) == 0);
+    // With fixed-length mode (min==max), one-sided 3' takes exactly that many nt before anchor.
+    assert(anchor_extract_window_range(&ar, "AAAAGGGGTCCAAA", 14, &start, &len) == 0);
+    assert(start == 4);
+    assert(len == 4);
+    assert(strncmp("AAAAGGGGTCCAAA" + start, "GGGG", len) == 0);
+
+    // Real-world regression: exact anchors should recover this 20nt guide.
+    cfg.anchor5 = "ATTTTCAATTTAACGTCG";
+    cfg.anchor3 = "GTTTTAGAGCTAGAAATA";
+    cfg.max_error = 0;
+    const char *real_read =
+        "CTCCGTGACCTATTTTCAATTTAACGTCGTCCGATGCAGGCTCCAGAGGGTTTTAGAGCTAGAAATAGCAAGTTAAAATAAGGCTAGTCCGTTATCAACTTGAAAAAGTGGCACCGAGTCGGTGCTTTTTTGCCTACCTGGAGCCTGAGA";
+    assert(anchor_runtime_init_range(&ar, &cfg, 20, 20) == 0);
+    assert(anchor_extract_window_range(&ar, real_read, strlen(real_read), &start, &len) == 0);
+    assert(len == 20);
+    assert(strncmp(real_read + start, "TCCGATGCAGGCTCCAGAGG", len) == 0);
+}
+
+static void test_anchor_extract_window_realworld_mm_indel(void) {
+    AnchorConfig cfg = {0};
+    AnchorRuntime ar = {0};
+    size_t start = 0, len = 0;
+
+    cfg.enabled = 1;
+    cfg.anchor5 = "ATTTTCAATTTAACGTCG";
+    cfg.anchor3 = "GTTTTAGAGCTAGAAATA";
+
+    const char *guide = "TCCGATGCAGGCTCCAGAGG";
+    const char *real_read =
+        "CTCCGTGACCTATTTTCAATTTAACGTCGTCCGATGCAGGCTCCAGAGGGTTTTAGAGCTAGAAATAGCAAGTTAAAATAAGGCTAGTCCGTTATCAACTTGAAAAAGTGGCACCGAGTCGGTGCTTTTTTGCCTACCTGGAGCCTGAGA";
+    size_t real_len = strlen(real_read);
+
+    const char *a5_pos = strstr(real_read, cfg.anchor5);
+    const char *a3_pos = strstr(real_read, cfg.anchor3);
+    assert(a5_pos != NULL);
+    assert(a3_pos != NULL);
+    size_t a5_start = (size_t)(a5_pos - real_read);
+    size_t a3_start = (size_t)(a3_pos - real_read);
+
+    // Case 1: one mismatch inside 5' anchor.
+    char read_mm[256];
+    assert(real_len + 1 < sizeof(read_mm));
+    memcpy(read_mm, real_read, real_len + 1);
+    read_mm[a5_start + 5] = (read_mm[a5_start + 5] == 'A') ? 'C' : 'A';
+
+    cfg.max_error = 0;
+    assert(anchor_runtime_init_range(&ar, &cfg, 20, 20) == 0);
+    assert(anchor_extract_window_range(&ar, read_mm, strlen(read_mm), &start, &len) == 1);
+
+    cfg.max_error = 1;
+    assert(anchor_runtime_init_range(&ar, &cfg, 20, 20) == 0);
+    assert(anchor_extract_window_range(&ar, read_mm, strlen(read_mm), &start, &len) == 0);
+    assert(len == 20);
+    assert(strncmp(read_mm + start, guide, len) == 0);
+
+    // Case 2: one deletion inside 3' anchor.
+    char read_del[256];
+    assert(real_len + 1 < sizeof(read_del));
+    size_t del_idx = a3_start + 7;
+    memcpy(read_del, real_read, del_idx);
+    memcpy(read_del + del_idx, real_read + del_idx + 1, real_len - del_idx);
+
+    cfg.max_error = 1;
+    assert(anchor_runtime_init_range(&ar, &cfg, 20, 20) == 0);
+    assert(anchor_extract_window_range(&ar, read_del, strlen(read_del), &start, &len) == 0);
+    assert(len == 20);
+    assert(strncmp(read_del + start, guide, len) == 0);
+}
+
+static void test_anchor_extract_window_error_with_extra_near_hit(void) {
+    AnchorConfig cfg = {0};
+    AnchorRuntime ar = {0};
+    size_t start = 0, len = 0;
+
+    cfg.enabled = 1;
+    cfg.anchor5 = "AAAA";
+    cfg.anchor3 = "TTTT";
+    cfg.max_error = 1;
+
+    // With max_error=1 there are multiple 5' near-hits ("AAAT", "AATA", ...),
+    // but only one valid anchor pair that yields a 3nt payload.
+    const char *read = "AAATAAAAGGGTTTT";
+    assert(anchor_runtime_init_range(&ar, &cfg, 3, 3) == 0);
+    assert(anchor_extract_window_range(&ar, read, strlen(read), &start, &len) == 0);
+    assert(start == 8);
+    assert(len == 3);
+    assert(strncmp(read + start, "GGG", len) == 0);
+}
+
 int main(void) {
     test_trie_insert_statuses();
     test_trie_search_exact_mm();
@@ -272,6 +414,9 @@ int main(void) {
     test_find_matches_multihit_qname_tag();
     test_find_matches_md_tag();
     test_sam_header_strip_and_dedupe();
+    test_anchor_extract_window_variants();
+    test_anchor_extract_window_realworld_mm_indel();
+    test_anchor_extract_window_error_with_extra_near_hit();
 
     fprintf(stderr, "All tests passed.\n");
     return 0;

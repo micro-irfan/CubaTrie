@@ -469,7 +469,8 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
                          const char *read_name,
                          const char *read_qual,
                          FILE *sam_fp,
-                         int sam_soft_clip) {
+                         int sam_soft_clip,
+                         int nh_override) {
     if (!sequence || !hit || !seed_index || !found_sequences) return;
     if (seed_mm < 0) seed_mm = 0;
     if (seed_mm > 1) seed_mm = 1;
@@ -568,7 +569,7 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
     }
 
     if (sam_fp && sam_records.n > 0) {
-        int nh = (int)sam_records.n;
+        int nh = nh_override > 0 ? nh_override : (int)sam_records.n;
         int has_full_qual = (read_qual && strlen(read_qual) == seq_len);
         SamTextBuf *sam_buf = &tls_sam_text_buf;
         sam_buf->len = 0;

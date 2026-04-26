@@ -6,13 +6,13 @@
 
 # ---- project ----
 TARGET := cubaTrie
-SRCS   := kalloc.c utils.c trie.c kmer.c readseq.c main.c 
+SRCS   := kalloc.c utils.c trie.c kmer.c readseq_anchor.c readseq.c readseq_thread.c readseq_reference.c readseq_cut.c main.c 
 OBJS   := $(SRCS:.c=.o)
 DEPS   := $(OBJS:.o=.d)
 TEST_TARGET := cuba_trie_tests
-TEST_SRCS   := tests/test_main.c trie.c kmer.c utils.c kalloc.c
+TEST_SRCS   := tests/test_main.c trie.c kmer.c utils.c kalloc.c readseq_anchor.c
 GOLDEN_TEST_TARGET := cuba_trie_golden_tests
-GOLDEN_TEST_SRCS   := tests/golden_test.c readseq.c trie.c kmer.c utils.c kalloc.c
+GOLDEN_TEST_SRCS   := tests/golden_test.c readseq.c readseq_thread.c readseq_reference.c readseq_anchor.c trie.c kmer.c utils.c kalloc.c
 TEST_DEPS := $(TEST_TARGET).d $(GOLDEN_TEST_TARGET).d
 
 # ---- toolchain ----

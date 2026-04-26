@@ -1,3 +1,6 @@
+#ifndef KMER_H
+#define KMER_H
+
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -66,4 +69,7 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
                          const char *read_name,
                          const char *read_qual,
                          FILE *sam_fp,
-                         int sam_soft_clip);
+                         int sam_soft_clip,
+                         int nh_override);
+
+#endif
