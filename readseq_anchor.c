@@ -138,30 +138,50 @@ static size_t anchor_collect_matches(const BitapPattern *pat,
     return n;
 }
 
+static int bitap_find_first_exact(const BitapPattern *pat,
+                                  const char *text,
+                                  size_t text_len,
+                                  size_t from_pos,
+                                  AnchorMatch *out_hit) {
+    if (!pat || !text || !out_hit) return -1;
+    if (from_pos >= text_len || pat->len == 0) return 1;
+    if (pat->len > 63) return -1;
+
+    size_t m = pat->len;
+    uint64_t full_mask = ((uint64_t)1 << m) - 1ULL;
+    uint64_t accept_bit = (uint64_t)1 << (m - 1);
+    uint64_t state = 0ULL;
+
+    for (size_t i = from_pos; i < text_len; ++i) {
+        unsigned char c = (unsigned char)toupper((unsigned char)text[i]);
+        uint64_t eq = (~pat->mask[c]) & full_mask;
+        state = ((state << 1) | 1ULL) & eq;
+        if (state & accept_bit) {
+            size_t end = i + 1;
+            out_hit->start = end - m;
+            out_hit->end = end;
+            out_hit->errors = 0;
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static size_t anchor_collect_matches_exact(const BitapPattern *pat,
                                            const char *read_seq,
                                            size_t read_len,
                                            size_t from_pos,
                                            AnchorMatch *hits,
                                            size_t hits_cap) {
-    if (!pat || !read_seq || !hits || hits_cap == 0) return 0;
-    size_t m = pat->len;
-    if (m == 0 || from_pos >= read_len || read_len - from_pos < m) return 0;
-
+    if (!pat || !read_seq || !hits || hits_cap == 0 || from_pos >= read_len) return 0;
     size_t n = 0;
-    for (size_t s = from_pos; s + m <= read_len && n < hits_cap; ++s) {
-        size_t j = 0;
-        while (j < m) {
-            unsigned char tc = (unsigned char)toupper((unsigned char)read_seq[s + j]);
-            if (tc != (unsigned char)pat->seq[j]) break;
-            ++j;
-        }
-        if (j == m) {
-            hits[n].start = s;
-            hits[n].end = s + m;
-            hits[n].errors = 0;
-            ++n;
-        }
+    size_t cursor = from_pos;
+    while (n < hits_cap && cursor < read_len) {
+        AnchorMatch h = {0};
+        int rc = bitap_find_first_exact(pat, read_seq, read_len, cursor, &h);
+        if (rc != 0) break;
+        hits[n++] = h;
+        cursor = (h.start + 1 > cursor) ? (h.start + 1) : (cursor + 1);
     }
     return n;
 }
