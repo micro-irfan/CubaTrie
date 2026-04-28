@@ -117,6 +117,8 @@ Notes:
 - Coordinates in `ins`, `a5`, and `a3` are 1-based.
 - Coordinates in `a3rc` are also 1-based.
 - `a5` and/or `a3` are present depending on anchor mode (both-sided or one-sided).
+- In `count` mode, two-sided anchors (`a5...a3`) determine insert boundaries directly (insert length is not forced to reference length).
+- In `count` mode, one-sided anchors keep fixed-length behavior (insert length follows reference length).
 - In two-sided mode, if full pairing fails but a single start anchor is confidently found, unmapped SAM may include `partial=1` with either `a5` or `a3rc`.
 - Reads without detected anchors do not receive `ZA:Z`.
 

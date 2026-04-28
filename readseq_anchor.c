@@ -20,6 +20,10 @@ static char *anchor_revcomp_new_n(const char *s, size_t n) {
     return rc;
 }
 
+static size_t usize_abs_diff(size_t a, size_t b) {
+    return (a >= b) ? (a - b) : (b - a);
+}
+
 static int bitap_pattern_build(BitapPattern *out, const char *pattern) {
     if (!out || !pattern) return -1;
     size_t m = strlen(pattern);
@@ -71,6 +75,12 @@ static int bitap_find_first(const BitapPattern *pat,
         prev_start[i] = 0;
     }
 
+    int found = 0;
+    int best_err = 0;
+    size_t best_start = 0;
+    size_t best_end = 0;
+    size_t best_span_diff = 0;
+
     for (size_t col = 1; col <= n; ++col) {
         curr[0] = 0;
         curr_start[0] = col; // empty pattern can start at current boundary
@@ -101,10 +111,23 @@ static int bitap_find_first(const BitapPattern *pat,
         }
 
         if (curr[m] <= mm) {
-            out_hit->start = from_pos + curr_start[m];
-            out_hit->end = from_pos + col;
-            out_hit->errors = curr[m];
-            return 0;
+            size_t cand_start = from_pos + curr_start[m];
+            size_t cand_end = from_pos + col;
+            size_t cand_len = (cand_end > cand_start) ? (cand_end - cand_start) : 0;
+            size_t cand_span_diff = usize_abs_diff(cand_len, m);
+            int cand_err = curr[m];
+
+            if (!found ||
+                cand_start < best_start ||
+                (cand_start == best_start && cand_err < best_err) ||
+                (cand_start == best_start && cand_err == best_err && cand_span_diff < best_span_diff) ||
+                (cand_start == best_start && cand_err == best_err && cand_span_diff == best_span_diff && cand_end < best_end)) {
+                found = 1;
+                best_err = cand_err;
+                best_start = cand_start;
+                best_end = cand_end;
+                best_span_diff = cand_span_diff;
+            }
         }
 
         int *tmp_i = prev;
@@ -115,7 +138,11 @@ static int bitap_find_first(const BitapPattern *pat,
         curr_start = tmp_s;
     }
 
-    return 1;
+    if (!found) return 1;
+    out_hit->start = best_start;
+    out_hit->end = best_end;
+    out_hit->errors = best_err;
+    return 0;
 }
 
 static size_t anchor_collect_matches(const BitapPattern *pat,
@@ -207,6 +234,8 @@ typedef struct {
 static int candidate_score_cmp(const AnchorCandidate *a, const AnchorCandidate *b) {
     if (a->errors != b->errors) return (a->errors < b->errors) ? -1 : 1;
     if (a->first_start != b->first_start) return (a->first_start < b->first_start) ? -1 : 1;
+    if (a->insert_len != b->insert_len) return (a->insert_len < b->insert_len) ? -1 : 1;
+    if (a->insert_start != b->insert_start) return (a->insert_start < b->insert_start) ? -1 : 1;
     return 0;
 }
 

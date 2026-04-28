@@ -15,6 +15,20 @@ static const size_t MT_TASK_QUEUE_CAPACITY = 1024;
 static const size_t MT_READ_BATCH_TARGET_BASES = 16u * 1024u * 1024u;
 static const size_t MT_READ_BATCH_MAX_READS = 4096;
 
+static int anchor_runtime_init_for_count_mode(AnchorRuntime *out,
+                                              const AnchorConfig *cfg,
+                                              size_t ref_len) {
+    if (!out) return -1;
+    if (!cfg || !cfg->enabled) return anchor_runtime_init(out, cfg, ref_len);
+    int has5 = (cfg->anchor5 && cfg->anchor5[0] != '\0');
+    int has3 = (cfg->anchor3 && cfg->anchor3[0] != '\0');
+    if (has5 && has3) {
+        // In count mode, paired anchors define insert boundaries.
+        return anchor_runtime_init_range(out, cfg, 1, (size_t)-1);
+    }
+    return anchor_runtime_init(out, cfg, ref_len);
+}
+
 typedef struct {
     char *name;
     char *seq;
@@ -330,7 +344,7 @@ int readseq_load_fastq_mt(const char *path,
         gzclose(fp);
         return 1;
     }
-    if (anchor_runtime_init(&anchor_runtime, anchor_cfg, *min_len) != 0) {
+    if (anchor_runtime_init_for_count_mode(&anchor_runtime, anchor_cfg, *min_len) != 0) {
         fprintf(stderr, "Failed to initialize anchor matcher. Check adapter sequences.\n");
         kmer_bitset_destroy(seed_index);
         fastq_queue_destroy(&queue);
