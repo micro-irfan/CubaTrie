@@ -101,6 +101,13 @@ ZA:Z:ori=<FWD|RC>;partial=1;a5=<start_1based>-<end_1based>,ed=<int>,md=<MD_like>
 ZA:Z:ori=<FWD|RC>;partial=1;a3rc=<start_1based>-<end_1based>,ed=<int>,md=<MD_like>
 ```
 
+Expected format (two-sided mode unmapped diagnostics):
+
+```text
+ZA:Z:ori=<FWD|RC>;ins=<insert_start_1based>,<observed_insert_len>;exp=<reference_len>;reason=<insert_len_lt|insert_len_gt|anchor_ambiguous|anchor_window_rejected>
+ZA:Z:ori=<FWD|RC>;ins=<insert_start_1based>,<observed_insert_len>;exp=<reference_len>;reason=<...>;a5=<start_1based>-<end_1based>,ed=<int>,md=<MD_like>;a3=<start_1based>-<end_1based>,ed=<int>,md=<MD_like>
+```
+
 Field meaning:
 
 - `ori`: orientation of anchor detection in the read (`FWD` or `RC`).
@@ -109,6 +116,8 @@ Field meaning:
 - `a3`: 3' anchor match window in read coordinates.
 - `a3rc`: reverse-complement 3' anchor start hit (reported only in two-sided fallback mode with `ori=RC`).
 - `partial=1`: indicates two-sided anchor mode fallback where only a start anchor (`a5` or `a3rc`) was confidently detected.
+- `exp`: expected insert/reference length used by `count` mode.
+- `reason`: diagnostic reason for unmapped two-sided anchor attempts.
 - `ed`: anchor edit distance used by anchor matching.
 - `md`: MD-like string comparing read anchor segment against expected anchor sequence (`A/C/G/T`, digits for match runs, `^` for deletions from read relative to anchor).
 
@@ -117,9 +126,10 @@ Notes:
 - Coordinates in `ins`, `a5`, and `a3` are 1-based.
 - Coordinates in `a3rc` are also 1-based.
 - `a5` and/or `a3` are present depending on anchor mode (both-sided or one-sided).
-- In `count` mode, two-sided anchors (`a5...a3`) determine insert boundaries directly (insert length is not forced to reference length).
+- In `count` mode, two-sided anchors (`a5...a3`) must bracket an insert whose length matches the reference length.
 - In `count` mode, one-sided anchors keep fixed-length behavior (insert length follows reference length).
 - In two-sided mode, if full pairing fails but a single start anchor is confidently found, unmapped SAM may include `partial=1` with either `a5` or `a3rc`.
+- In two-sided mode, unmapped SAM may include a diagnostic `reason` tag; for length failures it also includes observed `ins` and expected `exp`.
 - Reads without detected anchors do not receive `ZA:Z`.
 
 Examples:
@@ -128,6 +138,7 @@ Examples:
 ZA:Z:ori=FWD;ins=31,20;a5=13-30,ed=0,md=18;a3=51-68,ed=1,md=7A10
 ZA:Z:ori=RC;ins=31,20;a5=55-72,ed=1,md=7A10;a3=9-26,ed=0,md=18
 ZA:Z:ori=FWD;ins=19,20;a5=1-18,ed=0,md=18
+ZA:Z:ori=FWD;ins=31,22;exp=20;reason=insert_len_gt;a5=13-30,ed=0,md=18;a3=53-70,ed=1,md=7A10
 ZA:Z:ori=FWD;partial=1;a5=1-18,ed=0,md=18
 ZA:Z:ori=RC;partial=1;a3rc=3-20,ed=1,md=7A10
 ```

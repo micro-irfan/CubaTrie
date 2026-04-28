@@ -53,13 +53,8 @@ static int anchor_runtime_init_for_count_mode(AnchorRuntime *out,
                                               size_t ref_len) {
     if (!out) return -1;
     if (!cfg || !cfg->enabled) return anchor_runtime_init(out, cfg, ref_len);
-    int has5 = (cfg->anchor5 && cfg->anchor5[0] != '\0');
-    int has3 = (cfg->anchor3 && cfg->anchor3[0] != '\0');
-    if (has5 && has3) {
-        // In count mode, paired anchors define the insert boundaries directly.
-        // Keep one-sided anchor behavior unchanged (fixed reference length).
-        return anchor_runtime_init_range(out, cfg, 1, (size_t)-1);
-    }
+    // In count mode, enforce insert length to match reference length so anchor
+    // distance stays consistent with the mapped short-reference length.
     return anchor_runtime_init(out, cfg, ref_len);
 }
 
@@ -322,6 +317,81 @@ static int anchor_build_partial_two_sided_start_sam_tag(const AnchorRuntime *ar,
     return -1;
 }
 
+static int anchor_build_unmapped_reason_tag(const AnchorRuntime *ar,
+                                            const char *read_seq,
+                                            size_t read_len,
+                                            const AnchorWindowInfo *info,
+                                            int have_info,
+                                            const char *reason,
+                                            size_t expected_len,
+                                            char *tag_out,
+                                            size_t tag_cap) {
+    if (!reason || !tag_out || tag_cap == 0) return -1;
+    size_t len = 0;
+    tag_out[0] = '\0';
+    if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, "\tZA:Z:") != 0) return -1;
+
+    if (have_info && info) {
+        if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, "ori=") != 0) return -1;
+        if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len,
+                                       info->orientation == ANCHOR_ORIENT_RC ? "RC" : "FWD") != 0) return -1;
+        if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ";ins=") != 0) return -1;
+        if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, info->insert_start + 1) != 0) return -1;
+        if (anchor_tag_buf_append_char(tag_out, tag_cap, &len, ',') != 0) return -1;
+        if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, info->insert_len) != 0) return -1;
+        if (expected_len > 0) {
+            if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ";exp=") != 0) return -1;
+            if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, expected_len) != 0) return -1;
+        }
+        if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ";reason=") != 0) return -1;
+    } else {
+        if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, "reason=") != 0) return -1;
+    }
+    if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, reason) != 0) return -1;
+
+    // Optional anchor-level detail block for diagnostics when both anchors were found.
+    if (have_info && info && ar && read_seq) {
+        if (info->has_anchor5 && info->anchor5_end >= info->anchor5_start &&
+            info->anchor5_end <= read_len) {
+            size_t seg_len = info->anchor5_end - info->anchor5_start;
+            char md5[256];
+            const char *a5_ref = (info->orientation == ANCHOR_ORIENT_RC) ? ar->a5_rc.seq : ar->a5.seq;
+            if (anchor_compute_md(a5_ref, strlen(a5_ref),
+                                  read_seq + info->anchor5_start, seg_len,
+                                  md5, sizeof(md5)) == 0) {
+                if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ";a5=") != 0) return -1;
+                if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, info->anchor5_start + 1) != 0) return -1;
+                if (anchor_tag_buf_append_char(tag_out, tag_cap, &len, '-') != 0) return -1;
+                if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, info->anchor5_end) != 0) return -1;
+                if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ",ed=") != 0) return -1;
+                if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, (size_t)((info->anchor5_errors < 0) ? 0 : info->anchor5_errors)) != 0) return -1;
+                if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ",md=") != 0) return -1;
+                if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, md5) != 0) return -1;
+            }
+        }
+
+        if (info->has_anchor3 && info->anchor3_end >= info->anchor3_start &&
+            info->anchor3_end <= read_len) {
+            size_t seg_len = info->anchor3_end - info->anchor3_start;
+            char md3[256];
+            const char *a3_ref = (info->orientation == ANCHOR_ORIENT_RC) ? ar->a3_rc.seq : ar->a3.seq;
+            if (anchor_compute_md(a3_ref, strlen(a3_ref),
+                                  read_seq + info->anchor3_start, seg_len,
+                                  md3, sizeof(md3)) == 0) {
+                if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ";a3=") != 0) return -1;
+                if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, info->anchor3_start + 1) != 0) return -1;
+                if (anchor_tag_buf_append_char(tag_out, tag_cap, &len, '-') != 0) return -1;
+                if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, info->anchor3_end) != 0) return -1;
+                if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ",ed=") != 0) return -1;
+                if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, (size_t)((info->anchor3_errors < 0) ? 0 : info->anchor3_errors)) != 0) return -1;
+                if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ",md=") != 0) return -1;
+                if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, md3) != 0) return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 static int add_matches_to_counter_hits(khash_t(strset) *found_sequences,
                                        kh_counter_t *map) {
     for (khint_t i = kh_begin(found_sequences); i != kh_end(found_sequences); ++i) {
@@ -377,8 +447,63 @@ int readseq_process_one_read(const char *read_name,
                 const char *partial_tag = NULL;
                 char partial_anchor_tag[1024];
                 AnchorWindowInfo partial_info = {0};
+                int have_reason_tag = 0;
+
+                if (anchor_runtime->has_anchor5 && anchor_runtime->has_anchor3) {
+                    AnchorWindowInfo best_pair_info = {0};
+                    int ambiguous = 0;
+                    int diag_rc = anchor_extract_two_sided_best_pair_info(anchor_runtime,
+                                                                          read_seq,
+                                                                          read_len,
+                                                                          &best_pair_info,
+                                                                          &ambiguous);
+                    if (diag_rc == 0) {
+                        if (ambiguous) {
+                            if (anchor_build_unmapped_reason_tag(anchor_runtime,
+                                                                 read_seq,
+                                                                 read_len,
+                                                                 &best_pair_info,
+                                                                 1,
+                                                                 "anchor_ambiguous",
+                                                                 min_len,
+                                                                 partial_anchor_tag,
+                                                                 sizeof(partial_anchor_tag)) == 0) {
+                                partial_tag = partial_anchor_tag;
+                                have_reason_tag = 1;
+                            }
+                        } else if (best_pair_info.insert_len < min_len || best_pair_info.insert_len > max_len) {
+                            const char *len_reason =
+                                (best_pair_info.insert_len < min_len) ? "insert_len_lt" : "insert_len_gt";
+                            if (anchor_build_unmapped_reason_tag(anchor_runtime,
+                                                                 read_seq,
+                                                                 read_len,
+                                                                 &best_pair_info,
+                                                                 1,
+                                                                 len_reason,
+                                                                 min_len,
+                                                                 partial_anchor_tag,
+                                                                 sizeof(partial_anchor_tag)) == 0) {
+                                partial_tag = partial_anchor_tag;
+                                have_reason_tag = 1;
+                            }
+                        } else if (anchor_build_unmapped_reason_tag(anchor_runtime,
+                                                                     read_seq,
+                                                                     read_len,
+                                                                     &best_pair_info,
+                                                                     1,
+                                                                     "anchor_window_rejected",
+                                                                     min_len,
+                                                                     partial_anchor_tag,
+                                                                     sizeof(partial_anchor_tag)) == 0) {
+                            partial_tag = partial_anchor_tag;
+                            have_reason_tag = 1;
+                        }
+                    }
+                }
+
                 if (anchor_runtime->has_anchor5 &&
                     anchor_runtime->has_anchor3 &&
+                    !have_reason_tag &&
                     anchor_extract_two_sided_partial_start_info(anchor_runtime,
                                                                 read_seq,
                                                                 read_len,

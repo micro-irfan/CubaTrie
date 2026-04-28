@@ -823,3 +823,49 @@ int anchor_extract_two_sided_partial_start_info(const AnchorRuntime *ar,
     anchor_window_info_fill(&best, info_out);
     return 0;
 }
+
+int anchor_extract_two_sided_best_pair_info(const AnchorRuntime *ar,
+                                            const char *read_seq,
+                                            size_t read_len,
+                                            AnchorWindowInfo *info_out,
+                                            int *ambiguous_out) {
+    if (!ar || !ar->enabled || !read_seq) return -1;
+    if (!ar->has_anchor5 || !ar->has_anchor3) return -1;
+
+    if (ambiguous_out) *ambiguous_out = 0;
+    if (info_out) memset(info_out, 0, sizeof(*info_out));
+
+    // Diagnostic search intentionally ignores insert-length constraints.
+    // This lets callers explain why constrained extraction failed.
+    AnchorCandidate best = {0};
+    AnchorCandidate fw = anchor_find_best_pair_exact(&ar->a5, &ar->a3,
+                                                     ANCHOR_ORIENT_FWD,
+                                                     read_seq, read_len,
+                                                     1, (size_t)-1);
+    AnchorCandidate rv = anchor_find_best_pair_exact(&ar->a3_rc, &ar->a5_rc,
+                                                     ANCHOR_ORIENT_RC,
+                                                     read_seq, read_len,
+                                                     1, (size_t)-1);
+    candidate_consider(&best, &fw);
+    candidate_consider(&best, &rv);
+
+    if (!best.valid) {
+        best.valid = 0;
+        best.ambiguous = 0;
+        fw = anchor_find_best_pair(&ar->a5, &ar->a3,
+                                   ANCHOR_ORIENT_FWD,
+                                   read_seq, read_len,
+                                   ar->max_error, 1, (size_t)-1);
+        rv = anchor_find_best_pair(&ar->a3_rc, &ar->a5_rc,
+                                   ANCHOR_ORIENT_RC,
+                                   read_seq, read_len,
+                                   ar->max_error, 1, (size_t)-1);
+        candidate_consider(&best, &fw);
+        candidate_consider(&best, &rv);
+    }
+
+    if (!best.valid) return 1;
+    if (ambiguous_out) *ambiguous_out = best.ambiguous ? 1 : 0;
+    if (info_out) anchor_window_info_fill(&best, info_out);
+    return 0;
+}

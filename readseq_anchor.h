@@ -84,4 +84,16 @@ int anchor_extract_two_sided_partial_start_info(const AnchorRuntime *ar,
                                                 size_t read_len,
                                                 AnchorWindowInfo *info_out);
 
+// Diagnostic helper for two-sided anchor mode:
+// finds the best anchor pair without insert-length constraints.
+// Returns:
+//   0 on at least one pair candidate found (info_out filled; ambiguous_out set 0/1)
+//   1 if no pair candidate exists
+//  -1 on invalid input/runtime
+int anchor_extract_two_sided_best_pair_info(const AnchorRuntime *ar,
+                                            const char *read_seq,
+                                            size_t read_len,
+                                            AnchorWindowInfo *info_out,
+                                            int *ambiguous_out);
+
 #endif

@@ -20,12 +20,8 @@ static int anchor_runtime_init_for_count_mode(AnchorRuntime *out,
                                               size_t ref_len) {
     if (!out) return -1;
     if (!cfg || !cfg->enabled) return anchor_runtime_init(out, cfg, ref_len);
-    int has5 = (cfg->anchor5 && cfg->anchor5[0] != '\0');
-    int has3 = (cfg->anchor3 && cfg->anchor3[0] != '\0');
-    if (has5 && has3) {
-        // In count mode, paired anchors define insert boundaries.
-        return anchor_runtime_init_range(out, cfg, 1, (size_t)-1);
-    }
+    // In count mode, enforce insert length to match reference length so anchor
+    // distance stays consistent with the mapped short-reference length.
     return anchor_runtime_init(out, cfg, ref_len);
 }
 
