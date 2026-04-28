@@ -5,6 +5,30 @@
 #include "kmer.h"
 #include "utils.h"
 
+static _Thread_local const char *g_sam_seq_override = NULL;
+static _Thread_local const char *g_sam_qual_override = NULL;
+static _Thread_local int g_sam_seq_len_override = -1;
+static _Thread_local int g_sam_clip_left_override = 0;
+
+void kmer_set_sam_read_override(
+    const char *seq,
+    const char *qual,
+    int seq_len,
+    int clip_left
+) {
+    g_sam_seq_override = seq;
+    g_sam_qual_override = qual;
+    g_sam_seq_len_override = seq_len;
+    g_sam_clip_left_override = clip_left;
+}
+
+void kmer_clear_sam_read_override(void) {
+    g_sam_seq_override = NULL;
+    g_sam_qual_override = NULL;
+    g_sam_seq_len_override = -1;
+    g_sam_clip_left_override = 0;
+}
+
 // comparator for qsort (ascending)
 static int cmp_u32_asc(const void *a, const void *b) {
     uint32_t x = *(const uint32_t*)a, y = *(const uint32_t*)b;
@@ -570,19 +594,28 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
 
     if (sam_fp && sam_records.n > 0) {
         int nh = nh_override > 0 ? nh_override : (int)sam_records.n;
-        int has_full_qual = (read_qual && strlen(read_qual) == seq_len);
+        const char *sam_seq = g_sam_seq_override ? g_sam_seq_override : sequence;
+        const char *sam_qual = g_sam_qual_override ? g_sam_qual_override : read_qual;
+        size_t sam_seq_len = (g_sam_seq_override && g_sam_seq_len_override > 0)
+                                 ? (size_t)g_sam_seq_len_override
+                                 : seq_len;
+        size_t sam_match_offset = (g_sam_seq_override && g_sam_clip_left_override > 0)
+                                      ? (size_t)g_sam_clip_left_override
+                                      : 0;
+        int has_full_qual = (sam_qual && strlen(sam_qual) >= sam_seq_len);
         SamTextBuf *sam_buf = &tls_sam_text_buf;
         sam_buf->len = 0;
         int write_status = 0;
         for (size_t i = 0; i < sam_records.n; ++i) {
+            size_t sam_match_start = sam_records.a[i].match_start + sam_match_offset;
             if (sam_write_alignment(sam_buf,
                                     read_name,
-                                    sequence,
-                                    read_qual,
-                                    seq_len,
+                                    sam_seq,
+                                    sam_qual,
+                                    sam_seq_len,
                                     sam_records.a[i].ref_name,
                                     sam_records.a[i].ref_seq,
-                                    sam_records.a[i].match_start,
+                                    sam_match_start,
                                     sam_records.a[i].match_len,
                                     sam_records.a[i].nm,
                                     nh,
@@ -699,19 +732,28 @@ void find_matches(const char *sequence, size_t seq_len,
 
     if (sam_fp && sam_records.n > 0) {
         int nh = (int)sam_records.n;
-        int has_full_qual = (read_qual && strlen(read_qual) == seq_len);
+        const char *sam_seq = g_sam_seq_override ? g_sam_seq_override : sequence;
+        const char *sam_qual = g_sam_qual_override ? g_sam_qual_override : read_qual;
+        size_t sam_seq_len = (g_sam_seq_override && g_sam_seq_len_override > 0)
+                                 ? (size_t)g_sam_seq_len_override
+                                 : seq_len;
+        size_t sam_match_offset = (g_sam_seq_override && g_sam_clip_left_override > 0)
+                                      ? (size_t)g_sam_clip_left_override
+                                      : 0;
+        int has_full_qual = (sam_qual && strlen(sam_qual) >= sam_seq_len);
         SamTextBuf *sam_buf = &tls_sam_text_buf;
         sam_buf->len = 0;
         int write_status = 0;
         for (size_t i = 0; i < sam_records.n; ++i) {
+            size_t sam_match_start = sam_records.a[i].match_start + sam_match_offset;
             if (sam_write_alignment(sam_buf,
                                     read_name,
-                                    sequence,
-                                    read_qual,
-                                    seq_len,
+                                    sam_seq,
+                                    sam_qual,
+                                    sam_seq_len,
                                     sam_records.a[i].ref_name,
                                     sam_records.a[i].ref_seq,
-                                    sam_records.a[i].match_start,
+                                    sam_match_start,
                                     sam_records.a[i].match_len,
                                     sam_records.a[i].nm,
                                     nh,

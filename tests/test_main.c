@@ -238,6 +238,104 @@ static void test_find_matches_md_tag(void) {
     trie_free_node(root);
 }
 
+static void test_find_matches_seeded_sam_override_hard_clip(void) {
+    TrieNode *root = trie_create_node();
+    assert(root != NULL);
+    assert(trie_insert(root, "ACGT", "ref1", 0) == TRIE_INSERT_OK);
+
+    KmerBitset *index = kmer_bitset_from_trie(root, 4);
+    assert(index != NULL);
+
+    u32vec_t hit;
+    kv_init(hit);
+    find_kmer_bitset("ACGT", 4, index, 0, &hit);
+    assert(hit.n == 1);
+    assert(hit.a[0] == 0);
+
+    khash_t(strset) *found = kh_init(strset);
+    assert(found != NULL);
+
+    FILE *fp = tmpfile();
+    assert(fp != NULL);
+
+    kmer_set_sam_read_override("TTACGTAA", "ABCDEFGH", 8, 2);
+    find_matches_seeded("ACGT",
+                        4,
+                        &hit,
+                        4,
+                        4,
+                        index,
+                        0,
+                        found,
+                        0,
+                        "readAnchor",
+                        "CDEF",
+                        fp,
+                        0,
+                        0);
+    kmer_clear_sam_read_override();
+
+    char *sam = read_tmpfile_all(fp);
+    assert(sam != NULL);
+    assert(strstr(sam, "readAnchor\t0\tref1\t1\t255\t2H4M2H\t*\t0\t0\tACGT\tCDEF\tNM:i:0") != NULL);
+
+    free(sam);
+    fclose(fp);
+    kv_destroy(hit);
+    free_strset_keys_and_destroy(found);
+    kmer_bitset_destroy(index);
+    trie_free_node(root);
+}
+
+static void test_find_matches_seeded_sam_override_soft_clip(void) {
+    TrieNode *root = trie_create_node();
+    assert(root != NULL);
+    assert(trie_insert(root, "ACGT", "ref1", 0) == TRIE_INSERT_OK);
+
+    KmerBitset *index = kmer_bitset_from_trie(root, 4);
+    assert(index != NULL);
+
+    u32vec_t hit;
+    kv_init(hit);
+    find_kmer_bitset("ACGT", 4, index, 0, &hit);
+    assert(hit.n == 1);
+    assert(hit.a[0] == 0);
+
+    khash_t(strset) *found = kh_init(strset);
+    assert(found != NULL);
+
+    FILE *fp = tmpfile();
+    assert(fp != NULL);
+
+    kmer_set_sam_read_override("TTACGTAA", "ABCDEFGH", 8, 2);
+    find_matches_seeded("ACGT",
+                        4,
+                        &hit,
+                        4,
+                        4,
+                        index,
+                        0,
+                        found,
+                        0,
+                        "readAnchor",
+                        "CDEF",
+                        fp,
+                        1,
+                        0);
+    kmer_clear_sam_read_override();
+
+    char *sam = read_tmpfile_all(fp);
+    assert(sam != NULL);
+    assert(strstr(sam, "readAnchor\t0\tref1\t1\t255\t2S4M2S\t*\t0\t0\tTTACGTAA\tABCDEFGH\tNM:i:0") != NULL);
+
+    free(sam);
+    fclose(fp);
+    kv_destroy(hit);
+    free_strset_keys_and_destroy(found);
+    kmer_bitset_destroy(index);
+    trie_free_node(root);
+}
+
 static void test_sam_header_strip_and_dedupe(void) {
     TrieNode *root = trie_create_node();
     assert(root != NULL);
@@ -413,6 +511,8 @@ int main(void) {
     test_find_matches_sam_line_soft_clip();
     test_find_matches_multihit_qname_tag();
     test_find_matches_md_tag();
+    test_find_matches_seeded_sam_override_hard_clip();
+    test_find_matches_seeded_sam_override_soft_clip();
     test_sam_header_strip_and_dedupe();
     test_anchor_extract_window_variants();
     test_anchor_extract_window_realworld_mm_indel();

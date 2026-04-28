@@ -86,6 +86,8 @@ int readseq_process_one_read(const char *read_name,
     size_t anchor_insert_start = 0;
     size_t anchor_insert_len = 0;
 
+    kmer_clear_sam_read_override();
+
     if (anchor_runtime && anchor_runtime->enabled) {
         if (anchor_extract_window(anchor_runtime,
                                   read_seq,
@@ -192,7 +194,8 @@ int readseq_process_one_read(const char *read_name,
             }
         }
 
-        // 3) Emit SAM for anchor-extracted hits only, with NH based on total combined hits.
+        // 3) Emit SAM for anchor-extracted hits only.
+        // NH should reflect records emitted to SAM (not suppressed remainder hits).
         if (sam_out && anchor_hits > 0) {
             sam_matches = kh_init(strset);
             if (!sam_matches) {
@@ -202,6 +205,12 @@ int readseq_process_one_read(const char *read_name,
             hits.n = 0;
             find_kmer_bitset(search_seq, search_len, seed_index, seed_mm, &hits);
             if (hits.n > 0) {
+                const char *full_read_qual =
+                    (read_qual && strlen(read_qual) == read_len) ? read_qual : NULL;
+                kmer_set_sam_read_override(read_seq,
+                                           full_read_qual,
+                                           (int)read_len,
+                                           (int)anchor_insert_start);
                 find_matches_seeded(search_seq,
                                     search_len,
                                     &hits,
@@ -215,7 +224,8 @@ int readseq_process_one_read(const char *read_name,
                                     search_qual,
                                     sam_out,
                                     sam_soft_clip,
-                                    (int)kh_size(matches));
+                                    0);
+                kmer_clear_sam_read_override();
             }
         }
     } else {
@@ -259,6 +269,7 @@ int readseq_process_one_read(const char *read_name,
     }
 
 cleanup:
+    kmer_clear_sam_read_override();
     if (sam_matches) {
         strset_clear_with_keys(sam_matches);
         kh_destroy(strset, sam_matches);

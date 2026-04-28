@@ -72,4 +72,12 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
                          int sam_soft_clip,
                          int nh_override);
 
+void kmer_set_sam_read_override(
+    const char *seq,
+    const char *qual,
+    int seq_len,
+    int clip_left
+);
+void kmer_clear_sam_read_override(void);
+
 #endif
