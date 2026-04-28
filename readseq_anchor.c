@@ -193,6 +193,15 @@ typedef struct {
     size_t first_start;
     size_t insert_start;
     size_t insert_len;
+    AnchorOrientation orientation;
+    int has_anchor5;
+    size_t anchor5_start;
+    size_t anchor5_end;
+    int anchor5_errors;
+    int has_anchor3;
+    size_t anchor3_start;
+    size_t anchor3_end;
+    int anchor3_errors;
 } AnchorCandidate;
 
 static int candidate_score_cmp(const AnchorCandidate *a, const AnchorCandidate *b) {
@@ -226,6 +235,7 @@ static void candidate_consider(AnchorCandidate *best, const AnchorCandidate *can
 
 static void candidate_from_pair(const AnchorMatch *start_hit,
                                 const AnchorMatch *end_hit,
+                                AnchorOrientation orientation,
                                 size_t min_len,
                                 size_t max_len,
                                 AnchorCandidate *out) {
@@ -239,10 +249,29 @@ static void candidate_from_pair(const AnchorMatch *start_hit,
     out->first_start = start_hit->start;
     out->insert_start = start_hit->end;
     out->insert_len = payload_len;
+    out->orientation = orientation;
+    out->has_anchor5 = 1;
+    out->has_anchor3 = 1;
+    if (orientation == ANCHOR_ORIENT_RC) {
+        out->anchor3_start = start_hit->start;
+        out->anchor3_end = start_hit->end;
+        out->anchor3_errors = start_hit->errors;
+        out->anchor5_start = end_hit->start;
+        out->anchor5_end = end_hit->end;
+        out->anchor5_errors = end_hit->errors;
+    } else {
+        out->anchor5_start = start_hit->start;
+        out->anchor5_end = start_hit->end;
+        out->anchor5_errors = start_hit->errors;
+        out->anchor3_start = end_hit->start;
+        out->anchor3_end = end_hit->end;
+        out->anchor3_errors = end_hit->errors;
+    }
 }
 
 static AnchorCandidate anchor_find_best_pair_exact(const BitapPattern *start_pat,
                                                    const BitapPattern *end_pat,
+                                                   AnchorOrientation orientation,
                                                    const char *read_seq,
                                                    size_t read_len,
                                                    size_t min_len,
@@ -260,7 +289,7 @@ static AnchorCandidate anchor_find_best_pair_exact(const BitapPattern *start_pat
         size_t nend = anchor_collect_matches_exact(end_pat, read_seq, read_len, s.end, end_hits, END_CAP);
         for (size_t j = 0; j < nend; ++j) {
             AnchorCandidate cand = {0};
-            candidate_from_pair(&s, &end_hits[j], min_len, max_len, &cand);
+            candidate_from_pair(&s, &end_hits[j], orientation, min_len, max_len, &cand);
             candidate_consider(&best, &cand);
         }
 
@@ -272,6 +301,7 @@ static AnchorCandidate anchor_find_best_pair_exact(const BitapPattern *start_pat
 }
 
 static AnchorCandidate anchor_find_best_5only_exact(const BitapPattern *start_pat,
+                                                    AnchorOrientation orientation,
                                                     const char *read_seq,
                                                     size_t read_len,
                                                     size_t min_len,
@@ -301,6 +331,11 @@ static AnchorCandidate anchor_find_best_5only_exact(const BitapPattern *start_pa
         cand.first_start = hits[i].start;
         cand.insert_start = insert_start;
         cand.insert_len = payload_len;
+        cand.orientation = orientation;
+        cand.has_anchor5 = 1;
+        cand.anchor5_start = hits[i].start;
+        cand.anchor5_end = hits[i].end;
+        cand.anchor5_errors = hits[i].errors;
         candidate_consider(&best, &cand);
         if (best.valid && !best.ambiguous) return best;
     }
@@ -308,6 +343,7 @@ static AnchorCandidate anchor_find_best_5only_exact(const BitapPattern *start_pa
 }
 
 static AnchorCandidate anchor_find_best_3only_exact(const BitapPattern *end_pat,
+                                                    AnchorOrientation orientation,
                                                     const char *read_seq,
                                                     size_t read_len,
                                                     size_t min_len,
@@ -338,6 +374,11 @@ static AnchorCandidate anchor_find_best_3only_exact(const BitapPattern *end_pat,
         cand.first_start = hits[i].start;
         cand.insert_start = insert_start;
         cand.insert_len = payload_len;
+        cand.orientation = orientation;
+        cand.has_anchor3 = 1;
+        cand.anchor3_start = hits[i].start;
+        cand.anchor3_end = hits[i].end;
+        cand.anchor3_errors = hits[i].errors;
         candidate_consider(&best, &cand);
         if (best.valid && !best.ambiguous) return best;
     }
@@ -346,6 +387,7 @@ static AnchorCandidate anchor_find_best_3only_exact(const BitapPattern *end_pat,
 
 static AnchorCandidate anchor_find_best_pair(const BitapPattern *start_pat,
                                              const BitapPattern *end_pat,
+                                             AnchorOrientation orientation,
                                              const char *read_seq,
                                              size_t read_len,
                                              int max_error,
@@ -364,7 +406,7 @@ static AnchorCandidate anchor_find_best_pair(const BitapPattern *start_pat,
         size_t nend = anchor_collect_matches(end_pat, read_seq, read_len, max_error, s.end, end_hits, END_CAP);
         for (size_t j = 0; j < nend; ++j) {
             AnchorCandidate cand = {0};
-            candidate_from_pair(&s, &end_hits[j], min_len, max_len, &cand);
+            candidate_from_pair(&s, &end_hits[j], orientation, min_len, max_len, &cand);
             candidate_consider(&best, &cand);
         }
 
@@ -377,6 +419,7 @@ static AnchorCandidate anchor_find_best_pair(const BitapPattern *start_pat,
 }
 
 static AnchorCandidate anchor_find_best_5only(const BitapPattern *start_pat,
+                                              AnchorOrientation orientation,
                                               const char *read_seq,
                                               size_t read_len,
                                               int max_error,
@@ -407,6 +450,11 @@ static AnchorCandidate anchor_find_best_5only(const BitapPattern *start_pat,
         cand.first_start = hits[i].start;
         cand.insert_start = insert_start;
         cand.insert_len = payload_len;
+        cand.orientation = orientation;
+        cand.has_anchor5 = 1;
+        cand.anchor5_start = hits[i].start;
+        cand.anchor5_end = hits[i].end;
+        cand.anchor5_errors = hits[i].errors;
         candidate_consider(&best, &cand);
 
         // For one-sided 5' mode, the first valid 0-error hit is optimal.
@@ -418,6 +466,7 @@ static AnchorCandidate anchor_find_best_5only(const BitapPattern *start_pat,
 }
 
 static AnchorCandidate anchor_find_best_3only(const BitapPattern *end_pat,
+                                              AnchorOrientation orientation,
                                               const char *read_seq,
                                               size_t read_len,
                                               int max_error,
@@ -449,12 +498,84 @@ static AnchorCandidate anchor_find_best_3only(const BitapPattern *end_pat,
         cand.first_start = hits[i].start;
         cand.insert_start = insert_start;
         cand.insert_len = payload_len;
+        cand.orientation = orientation;
+        cand.has_anchor3 = 1;
+        cand.anchor3_start = hits[i].start;
+        cand.anchor3_end = hits[i].end;
+        cand.anchor3_errors = hits[i].errors;
         candidate_consider(&best, &cand);
 
         // For one-sided 3' mode, the first valid 0-error hit is optimal.
         if (best.valid && !best.ambiguous && best.errors == 0) {
             return best;
         }
+    }
+    return best;
+}
+
+static AnchorCandidate anchor_find_best_start_only_exact(const BitapPattern *start_pat,
+                                                         AnchorOrientation orientation,
+                                                         int is_a5_anchor,
+                                                         const char *read_seq,
+                                                         size_t read_len) {
+    enum { START_CAP = 8 };
+    AnchorCandidate best = {0};
+    AnchorMatch hits[START_CAP];
+    size_t n = anchor_collect_matches_exact(start_pat, read_seq, read_len, 0, hits, START_CAP);
+    for (size_t i = 0; i < n; ++i) {
+        AnchorCandidate cand = {0};
+        cand.valid = 1;
+        cand.errors = hits[i].errors;
+        cand.first_start = hits[i].start;
+        cand.insert_start = hits[i].start;
+        cand.insert_len = start_pat->len;
+        cand.orientation = orientation;
+        if (is_a5_anchor) {
+            cand.has_anchor5 = 1;
+            cand.anchor5_start = hits[i].start;
+            cand.anchor5_end = hits[i].end;
+            cand.anchor5_errors = hits[i].errors;
+        } else {
+            cand.has_anchor3 = 1;
+            cand.anchor3_start = hits[i].start;
+            cand.anchor3_end = hits[i].end;
+            cand.anchor3_errors = hits[i].errors;
+        }
+        candidate_consider(&best, &cand);
+    }
+    return best;
+}
+
+static AnchorCandidate anchor_find_best_start_only(const BitapPattern *start_pat,
+                                                   AnchorOrientation orientation,
+                                                   int is_a5_anchor,
+                                                   const char *read_seq,
+                                                   size_t read_len,
+                                                   int max_error) {
+    enum { START_CAP = 8 };
+    AnchorCandidate best = {0};
+    AnchorMatch hits[START_CAP];
+    size_t n = anchor_collect_matches(start_pat, read_seq, read_len, max_error, 0, hits, START_CAP);
+    for (size_t i = 0; i < n; ++i) {
+        AnchorCandidate cand = {0};
+        cand.valid = 1;
+        cand.errors = hits[i].errors;
+        cand.first_start = hits[i].start;
+        cand.insert_start = hits[i].start;
+        cand.insert_len = start_pat->len;
+        cand.orientation = orientation;
+        if (is_a5_anchor) {
+            cand.has_anchor5 = 1;
+            cand.anchor5_start = hits[i].start;
+            cand.anchor5_end = hits[i].end;
+            cand.anchor5_errors = hits[i].errors;
+        } else {
+            cand.has_anchor3 = 1;
+            cand.anchor3_start = hits[i].start;
+            cand.anchor3_end = hits[i].end;
+            cand.anchor3_errors = hits[i].errors;
+        }
+        candidate_consider(&best, &cand);
     }
     return best;
 }
@@ -520,7 +641,7 @@ int anchor_extract_window(const AnchorRuntime *ar,
                           size_t read_len,
                           size_t *insert_start_out,
                           size_t *insert_len_out) {
-    return anchor_extract_window_range(ar, read_seq, read_len, insert_start_out, insert_len_out);
+    return anchor_extract_window_range_info(ar, read_seq, read_len, insert_start_out, insert_len_out, NULL);
 }
 
 int anchor_extract_window_range(const AnchorRuntime *ar,
@@ -528,6 +649,32 @@ int anchor_extract_window_range(const AnchorRuntime *ar,
                                 size_t read_len,
                                 size_t *insert_start_out,
                                 size_t *insert_len_out) {
+    return anchor_extract_window_range_info(ar, read_seq, read_len, insert_start_out, insert_len_out, NULL);
+}
+
+static void anchor_window_info_fill(const AnchorCandidate *best,
+                                    AnchorWindowInfo *info_out) {
+    if (!best || !info_out) return;
+    memset(info_out, 0, sizeof(*info_out));
+    info_out->orientation = best->orientation;
+    info_out->insert_start = best->insert_start;
+    info_out->insert_len = best->insert_len;
+    info_out->has_anchor5 = best->has_anchor5;
+    info_out->anchor5_start = best->anchor5_start;
+    info_out->anchor5_end = best->anchor5_end;
+    info_out->anchor5_errors = best->anchor5_errors;
+    info_out->has_anchor3 = best->has_anchor3;
+    info_out->anchor3_start = best->anchor3_start;
+    info_out->anchor3_end = best->anchor3_end;
+    info_out->anchor3_errors = best->anchor3_errors;
+}
+
+int anchor_extract_window_range_info(const AnchorRuntime *ar,
+                                     const char *read_seq,
+                                     size_t read_len,
+                                     size_t *insert_start_out,
+                                     size_t *insert_len_out,
+                                     AnchorWindowInfo *info_out) {
     if (!ar || !ar->enabled || !read_seq || !insert_start_out || !insert_len_out) return -1;
     size_t min_len = ar->min_insert_len;
     size_t max_len = ar->max_insert_len;
@@ -536,30 +683,37 @@ int anchor_extract_window_range(const AnchorRuntime *ar,
     // Fast path: try exact matching first for all error budgets (including --anchor-error 0).
     if (ar->has_anchor5 && ar->has_anchor3) {
         AnchorCandidate best = {0};
-        AnchorCandidate fw = anchor_find_best_pair_exact(&ar->a5, &ar->a3, read_seq, read_len, min_len, max_len);
-        AnchorCandidate rv = anchor_find_best_pair_exact(&ar->a3_rc, &ar->a5_rc, read_seq, read_len, min_len, max_len);
+        AnchorCandidate fw = anchor_find_best_pair_exact(&ar->a5, &ar->a3, ANCHOR_ORIENT_FWD,
+                                                         read_seq, read_len, min_len, max_len);
+        AnchorCandidate rv = anchor_find_best_pair_exact(&ar->a3_rc, &ar->a5_rc, ANCHOR_ORIENT_RC,
+                                                         read_seq, read_len, min_len, max_len);
         candidate_consider(&best, &fw);
         candidate_consider(&best, &rv);
         if (best.valid) {
             if (best.ambiguous) return 1;
             *insert_start_out = best.insert_start;
             *insert_len_out = best.insert_len;
+            anchor_window_info_fill(&best, info_out);
             return 0;
         }
     } else if (ar->has_anchor5) {
-        AnchorCandidate best = anchor_find_best_5only_exact(&ar->a5, read_seq, read_len, min_len, max_len);
+        AnchorCandidate best = anchor_find_best_5only_exact(&ar->a5, ANCHOR_ORIENT_FWD,
+                                                             read_seq, read_len, min_len, max_len);
         if (best.valid) {
             if (best.ambiguous) return 1;
             *insert_start_out = best.insert_start;
             *insert_len_out = best.insert_len;
+            anchor_window_info_fill(&best, info_out);
             return 0;
         }
     } else if (ar->has_anchor3) {
-        AnchorCandidate best = anchor_find_best_3only_exact(&ar->a3, read_seq, read_len, min_len, max_len);
+        AnchorCandidate best = anchor_find_best_3only_exact(&ar->a3, ANCHOR_ORIENT_FWD,
+                                                             read_seq, read_len, min_len, max_len);
         if (best.valid) {
             if (best.ambiguous) return 1;
             *insert_start_out = best.insert_start;
             *insert_len_out = best.insert_len;
+            anchor_window_info_fill(&best, info_out);
             return 0;
         }
     }
@@ -567,9 +721,11 @@ int anchor_extract_window_range(const AnchorRuntime *ar,
     if (ar->has_anchor5 && ar->has_anchor3) {
         AnchorCandidate best = {0};
         AnchorCandidate fw = anchor_find_best_pair(&ar->a5, &ar->a3,
+                                                   ANCHOR_ORIENT_FWD,
                                                    read_seq, read_len,
                                                    ar->max_error, min_len, max_len);
         AnchorCandidate rv = anchor_find_best_pair(&ar->a3_rc, &ar->a5_rc,
+                                                   ANCHOR_ORIENT_RC,
                                                    read_seq, read_len,
                                                    ar->max_error, min_len, max_len);
 
@@ -579,26 +735,62 @@ int anchor_extract_window_range(const AnchorRuntime *ar,
         if (!best.valid || best.ambiguous) return 1;
         *insert_start_out = best.insert_start;
         *insert_len_out = best.insert_len;
+        anchor_window_info_fill(&best, info_out);
         return 0;
     }
 
     if (ar->has_anchor5) {
-        AnchorCandidate best = anchor_find_best_5only(&ar->a5, read_seq, read_len,
+        AnchorCandidate best = anchor_find_best_5only(&ar->a5, ANCHOR_ORIENT_FWD,
+                                                      read_seq, read_len,
                                                       ar->max_error, min_len, max_len);
         if (!best.valid || best.ambiguous) return 1;
         *insert_start_out = best.insert_start;
         *insert_len_out = best.insert_len;
+        anchor_window_info_fill(&best, info_out);
         return 0;
     }
 
     if (ar->has_anchor3) {
-        AnchorCandidate best = anchor_find_best_3only(&ar->a3, read_seq, read_len,
+        AnchorCandidate best = anchor_find_best_3only(&ar->a3, ANCHOR_ORIENT_FWD,
+                                                      read_seq, read_len,
                                                       ar->max_error, min_len, max_len);
         if (!best.valid || best.ambiguous) return 1;
         *insert_start_out = best.insert_start;
         *insert_len_out = best.insert_len;
+        anchor_window_info_fill(&best, info_out);
         return 0;
     }
 
     return 1;
+}
+
+int anchor_extract_two_sided_partial_start_info(const AnchorRuntime *ar,
+                                                const char *read_seq,
+                                                size_t read_len,
+                                                AnchorWindowInfo *info_out) {
+    if (!ar || !ar->enabled || !read_seq || !info_out) return -1;
+    if (!ar->has_anchor5 || !ar->has_anchor3) return -1;
+
+    AnchorCandidate best = {0};
+    AnchorCandidate fw = anchor_find_best_start_only_exact(&ar->a5, ANCHOR_ORIENT_FWD, 1,
+                                                           read_seq, read_len);
+    AnchorCandidate rv = anchor_find_best_start_only_exact(&ar->a3_rc, ANCHOR_ORIENT_RC, 0,
+                                                           read_seq, read_len);
+    candidate_consider(&best, &fw);
+    candidate_consider(&best, &rv);
+    if (best.valid) {
+        if (best.ambiguous) return 1;
+        anchor_window_info_fill(&best, info_out);
+        return 0;
+    }
+
+    best.valid = 0;
+    best.ambiguous = 0;
+    fw = anchor_find_best_start_only(&ar->a5, ANCHOR_ORIENT_FWD, 1, read_seq, read_len, ar->max_error);
+    rv = anchor_find_best_start_only(&ar->a3_rc, ANCHOR_ORIENT_RC, 0, read_seq, read_len, ar->max_error);
+    candidate_consider(&best, &fw);
+    candidate_consider(&best, &rv);
+    if (!best.valid || best.ambiguous) return 1;
+    anchor_window_info_fill(&best, info_out);
+    return 0;
 }

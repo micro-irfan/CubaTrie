@@ -9,6 +9,7 @@ static _Thread_local const char *g_sam_seq_override = NULL;
 static _Thread_local const char *g_sam_qual_override = NULL;
 static _Thread_local int g_sam_seq_len_override = -1;
 static _Thread_local int g_sam_clip_left_override = 0;
+static _Thread_local const char *g_sam_optional_tag_override = NULL;
 
 void kmer_set_sam_read_override(
     const char *seq,
@@ -27,6 +28,14 @@ void kmer_clear_sam_read_override(void) {
     g_sam_qual_override = NULL;
     g_sam_seq_len_override = -1;
     g_sam_clip_left_override = 0;
+}
+
+void kmer_set_sam_optional_tag_override(const char *tag_text) {
+    g_sam_optional_tag_override = tag_text;
+}
+
+void kmer_clear_sam_optional_tag_override(void) {
+    g_sam_optional_tag_override = NULL;
 }
 
 // comparator for qsort (ascending)
@@ -249,6 +258,9 @@ static int sam_write_alignment(SamTextBuf *sam_buf,
         if (sam_buf_append_size(sam_buf, (size_t)nh) != 0) return -1;
     }
     if (sam_write_md_tag(sam_buf, read_seq, match_start, ref_seq, match_len) != 0) return -1;
+    if (g_sam_optional_tag_override && g_sam_optional_tag_override[0] != '\0') {
+        if (sam_buf_append_cstr(sam_buf, g_sam_optional_tag_override) != 0) return -1;
+    }
     if (sam_buf_append_char(sam_buf, '\n') != 0) return -1;
     return 0;
 }

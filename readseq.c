@@ -15,12 +15,18 @@ static void sam_write_unmapped(FILE *sam_fp,
                                const char *read_name,
                                const char *read_seq,
                                const char *read_qual,
-                               size_t read_len) {
+                               size_t read_len,
+                               const char *extra_tag) {
     if (!sam_fp || !read_name || !read_seq) return;
     const char *qual = (read_qual && strlen(read_qual) == read_len) ? read_qual : "*";
     size_t qname_len = name_len_no_rc_suffix(read_name);
-    fprintf(sam_fp, "%.*s\t4\t*\t0\t0\t*\t*\t0\t0\t%s\t%s\n",
-            (int)qname_len, read_name, read_seq, qual);
+    if (extra_tag && extra_tag[0] != '\0') {
+        fprintf(sam_fp, "%.*s\t4\t*\t0\t0\t*\t*\t0\t0\t%s\t%s%s\n",
+                (int)qname_len, read_name, read_seq, qual, extra_tag);
+    } else {
+        fprintf(sam_fp, "%.*s\t4\t*\t0\t0\t*\t*\t0\t0\t%s\t%s\n",
+                (int)qname_len, read_name, read_seq, qual);
+    }
 }
 
 void total_hits (const kh_counter_t *m, const size_t nreads) {
@@ -36,6 +42,12 @@ void total_hits (const kh_counter_t *m, const size_t nreads) {
 
 static _Thread_local khash_t(strset) *tls_matches = NULL;
 
+typedef struct {
+    char op;
+    char ref_base;
+    char read_base;
+} AnchorEditOp;
+
 static void strset_clear_with_keys(khash_t(strset) *set) {
     if (!set) return;
     for (khint_t i = kh_begin(set); i != kh_end(set); ++i) {
@@ -47,6 +59,252 @@ static void strset_clear_with_keys(khash_t(strset) *set) {
 static khash_t(strset) *tls_get_matches(void) {
     if (!tls_matches) tls_matches = kh_init(strset);
     return tls_matches;
+}
+
+static int anchor_tag_buf_append_char(char *buf, size_t cap, size_t *len, char c) {
+    if (!buf || !len || *len + 1 >= cap) return -1;
+    buf[*len] = c;
+    *len += 1;
+    buf[*len] = '\0';
+    return 0;
+}
+
+static int anchor_tag_buf_append_cstr(char *buf, size_t cap, size_t *len, const char *s) {
+    if (!buf || !len || !s) return -1;
+    while (*s) {
+        if (anchor_tag_buf_append_char(buf, cap, len, *s++) != 0) return -1;
+    }
+    return 0;
+}
+
+static int anchor_tag_buf_append_size(char *buf, size_t cap, size_t *len, size_t v) {
+    char tmp[32];
+    size_t n = 0;
+    do {
+        tmp[n++] = (char)('0' + (v % 10));
+        v /= 10;
+    } while (v > 0);
+    if (!buf || !len || *len + n >= cap) return -1;
+    for (size_t i = 0; i < n; ++i) {
+        buf[*len + i] = tmp[n - 1 - i];
+    }
+    *len += n;
+    buf[*len] = '\0';
+    return 0;
+}
+
+static int anchor_compute_md(const char *ref_seq,
+                             size_t ref_len,
+                             const char *read_seq,
+                             size_t read_len,
+                             char *md_out,
+                             size_t md_cap) {
+    if (!ref_seq || !read_seq || !md_out || md_cap == 0) return -1;
+    if (ref_len > 63 || read_len > 63) return -1;
+
+    int dp[64][64];
+    char bt[64][64];
+    for (size_t i = 0; i <= ref_len; ++i) {
+        dp[i][0] = (int)i;
+        bt[i][0] = 'D';
+    }
+    for (size_t j = 0; j <= read_len; ++j) {
+        dp[0][j] = (int)j;
+        bt[0][j] = 'I';
+    }
+    bt[0][0] = 'M';
+
+    for (size_t i = 1; i <= ref_len; ++i) {
+        for (size_t j = 1; j <= read_len; ++j) {
+            int sub_cost = (ref_seq[i - 1] == read_seq[j - 1]) ? 0 : 1;
+            int best = dp[i - 1][j - 1] + sub_cost;
+            char op = 'M';
+
+            int ins = dp[i][j - 1] + 1;
+            if (ins < best) {
+                best = ins;
+                op = 'I';
+            }
+            int del = dp[i - 1][j] + 1;
+            if (del < best) {
+                best = del;
+                op = 'D';
+            }
+            dp[i][j] = best;
+            bt[i][j] = op;
+        }
+    }
+
+    AnchorEditOp rev_ops[128];
+    size_t nops = 0;
+    size_t i = ref_len;
+    size_t j = read_len;
+    while (i > 0 || j > 0) {
+        char op = bt[i][j];
+        AnchorEditOp e = {0};
+        if (i > 0 && j > 0 && op == 'M') {
+            e.op = 'M';
+            e.ref_base = ref_seq[i - 1];
+            e.read_base = read_seq[j - 1];
+            --i;
+            --j;
+        } else if (j > 0 && (i == 0 || op == 'I')) {
+            e.op = 'I';
+            e.read_base = read_seq[j - 1];
+            --j;
+        } else if (i > 0) {
+            e.op = 'D';
+            e.ref_base = ref_seq[i - 1];
+            --i;
+        } else {
+            return -1;
+        }
+        if (nops >= sizeof(rev_ops) / sizeof(rev_ops[0])) return -1;
+        rev_ops[nops++] = e;
+    }
+
+    AnchorEditOp ops[128];
+    for (size_t k = 0; k < nops; ++k) ops[k] = rev_ops[nops - 1 - k];
+
+    size_t md_len = 0;
+    size_t run = 0;
+    int in_del = 0;
+    md_out[0] = '\0';
+    for (size_t k = 0; k < nops; ++k) {
+        AnchorEditOp e = ops[k];
+        if (e.op == 'M') {
+            if (e.ref_base == e.read_base) {
+                run++;
+            } else {
+                if (anchor_tag_buf_append_size(md_out, md_cap, &md_len, run) != 0) return -1;
+                if (anchor_tag_buf_append_char(md_out, md_cap, &md_len, e.ref_base) != 0) return -1;
+                run = 0;
+            }
+            in_del = 0;
+            continue;
+        }
+        if (e.op == 'D') {
+            if (!in_del) {
+                if (anchor_tag_buf_append_size(md_out, md_cap, &md_len, run) != 0) return -1;
+                run = 0;
+                if (anchor_tag_buf_append_char(md_out, md_cap, &md_len, '^') != 0) return -1;
+                in_del = 1;
+            }
+            if (anchor_tag_buf_append_char(md_out, md_cap, &md_len, e.ref_base) != 0) return -1;
+            continue;
+        }
+        in_del = 0;
+    }
+    if (anchor_tag_buf_append_size(md_out, md_cap, &md_len, run) != 0) return -1;
+    return 0;
+}
+
+static int anchor_build_sam_tag(const AnchorRuntime *ar,
+                                const char *read_seq,
+                                size_t read_len,
+                                const AnchorWindowInfo *info,
+                                char *tag_out,
+                                size_t tag_cap) {
+    if (!ar || !read_seq || !info || !tag_out || tag_cap == 0) return -1;
+    if (info->insert_start + info->insert_len > read_len) return -1;
+
+    size_t len = 0;
+    tag_out[0] = '\0';
+    if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, "\tZA:Z:ori=") != 0) return -1;
+    if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len,
+                                   info->orientation == ANCHOR_ORIENT_RC ? "RC" : "FWD") != 0) return -1;
+    if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ";ins=") != 0) return -1;
+    if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, info->insert_start + 1) != 0) return -1;
+    if (anchor_tag_buf_append_char(tag_out, tag_cap, &len, ',') != 0) return -1;
+    if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, info->insert_len) != 0) return -1;
+
+    if (info->has_anchor5) {
+        if (info->anchor5_end < info->anchor5_start) return -1;
+        size_t seg_len = info->anchor5_end - info->anchor5_start;
+        char md5[256];
+        const char *a5_ref = (info->orientation == ANCHOR_ORIENT_RC) ? ar->a5_rc.seq : ar->a5.seq;
+        if (info->anchor5_start >= read_len || info->anchor5_end > read_len) return -1;
+        if (anchor_compute_md(a5_ref, strlen(a5_ref), read_seq + info->anchor5_start, seg_len, md5, sizeof(md5)) != 0) return -1;
+        if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ";a5=") != 0) return -1;
+        if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, info->anchor5_start + 1) != 0) return -1;
+        if (anchor_tag_buf_append_char(tag_out, tag_cap, &len, '-') != 0) return -1;
+        if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, info->anchor5_end) != 0) return -1;
+        if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ",ed=") != 0) return -1;
+        if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, (size_t)((info->anchor5_errors < 0) ? 0 : info->anchor5_errors)) != 0) return -1;
+        if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ",md=") != 0) return -1;
+        if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, md5) != 0) return -1;
+    }
+
+    if (info->has_anchor3) {
+        if (info->anchor3_end < info->anchor3_start) return -1;
+        size_t seg_len = info->anchor3_end - info->anchor3_start;
+        char md3[256];
+        const char *a3_ref = (info->orientation == ANCHOR_ORIENT_RC) ? ar->a3_rc.seq : ar->a3.seq;
+        if (info->anchor3_start >= read_len || info->anchor3_end > read_len) return -1;
+        if (anchor_compute_md(a3_ref, strlen(a3_ref), read_seq + info->anchor3_start, seg_len, md3, sizeof(md3)) != 0) return -1;
+        if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ";a3=") != 0) return -1;
+        if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, info->anchor3_start + 1) != 0) return -1;
+        if (anchor_tag_buf_append_char(tag_out, tag_cap, &len, '-') != 0) return -1;
+        if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, info->anchor3_end) != 0) return -1;
+        if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ",ed=") != 0) return -1;
+        if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, (size_t)((info->anchor3_errors < 0) ? 0 : info->anchor3_errors)) != 0) return -1;
+        if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ",md=") != 0) return -1;
+        if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, md3) != 0) return -1;
+    }
+    return 0;
+}
+
+static int anchor_build_partial_two_sided_start_sam_tag(const AnchorRuntime *ar,
+                                                        const char *read_seq,
+                                                        size_t read_len,
+                                                        const AnchorWindowInfo *info,
+                                                        char *tag_out,
+                                                        size_t tag_cap) {
+    if (!ar || !read_seq || !info || !tag_out || tag_cap == 0) return -1;
+    size_t len = 0;
+    tag_out[0] = '\0';
+    if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, "\tZA:Z:ori=") != 0) return -1;
+    if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len,
+                                   info->orientation == ANCHOR_ORIENT_RC ? "RC" : "FWD") != 0) return -1;
+    if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ";partial=1;") != 0) return -1;
+
+    if (info->orientation == ANCHOR_ORIENT_FWD && info->has_anchor5) {
+        if (info->anchor5_end < info->anchor5_start || info->anchor5_end > read_len) return -1;
+        size_t seg_len = info->anchor5_end - info->anchor5_start;
+        char md[256];
+        if (anchor_compute_md(ar->a5.seq, strlen(ar->a5.seq),
+                              read_seq + info->anchor5_start, seg_len,
+                              md, sizeof(md)) != 0) return -1;
+        if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, "a5=") != 0) return -1;
+        if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, info->anchor5_start + 1) != 0) return -1;
+        if (anchor_tag_buf_append_char(tag_out, tag_cap, &len, '-') != 0) return -1;
+        if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, info->anchor5_end) != 0) return -1;
+        if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ",ed=") != 0) return -1;
+        if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, (size_t)((info->anchor5_errors < 0) ? 0 : info->anchor5_errors)) != 0) return -1;
+        if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ",md=") != 0) return -1;
+        if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, md) != 0) return -1;
+        return 0;
+    }
+
+    if (info->orientation == ANCHOR_ORIENT_RC && info->has_anchor3) {
+        if (info->anchor3_end < info->anchor3_start || info->anchor3_end > read_len) return -1;
+        size_t seg_len = info->anchor3_end - info->anchor3_start;
+        char md[256];
+        if (anchor_compute_md(ar->a3_rc.seq, strlen(ar->a3_rc.seq),
+                              read_seq + info->anchor3_start, seg_len,
+                              md, sizeof(md)) != 0) return -1;
+        if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, "a3rc=") != 0) return -1;
+        if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, info->anchor3_start + 1) != 0) return -1;
+        if (anchor_tag_buf_append_char(tag_out, tag_cap, &len, '-') != 0) return -1;
+        if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, info->anchor3_end) != 0) return -1;
+        if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ",ed=") != 0) return -1;
+        if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, (size_t)((info->anchor3_errors < 0) ? 0 : info->anchor3_errors)) != 0) return -1;
+        if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ",md=") != 0) return -1;
+        if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, md) != 0) return -1;
+        return 0;
+    }
+
+    return -1;
 }
 
 static int add_matches_to_counter_hits(khash_t(strset) *found_sequences,
@@ -85,19 +343,51 @@ int readseq_process_one_read(const char *read_name,
     size_t search_len = read_len;
     size_t anchor_insert_start = 0;
     size_t anchor_insert_len = 0;
+    AnchorWindowInfo anchor_info = {0};
+    int have_anchor_info = 0;
+    char anchor_sam_tag[1024];
+    int have_anchor_sam_tag = 0;
 
     kmer_clear_sam_read_override();
+    kmer_clear_sam_optional_tag_override();
 
     if (anchor_runtime && anchor_runtime->enabled) {
-        if (anchor_extract_window(anchor_runtime,
-                                  read_seq,
-                                  read_len,
-                                  &anchor_insert_start,
-                                  &anchor_insert_len) != 0) {
+        if (anchor_extract_window_range_info(anchor_runtime,
+                                             read_seq,
+                                             read_len,
+                                             &anchor_insert_start,
+                                             &anchor_insert_len,
+                                             &anchor_info) != 0) {
             if (sam_out && sam_emit_unmapped) {
-                sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len);
+                const char *partial_tag = NULL;
+                char partial_anchor_tag[1024];
+                AnchorWindowInfo partial_info = {0};
+                if (anchor_runtime->has_anchor5 &&
+                    anchor_runtime->has_anchor3 &&
+                    anchor_extract_two_sided_partial_start_info(anchor_runtime,
+                                                                read_seq,
+                                                                read_len,
+                                                                &partial_info) == 0 &&
+                    anchor_build_partial_two_sided_start_sam_tag(anchor_runtime,
+                                                                 read_seq,
+                                                                 read_len,
+                                                                 &partial_info,
+                                                                 partial_anchor_tag,
+                                                                 sizeof(partial_anchor_tag)) == 0) {
+                    partial_tag = partial_anchor_tag;
+                }
+                sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len, partial_tag);
             }
             goto cleanup;
+        }
+        have_anchor_info = 1;
+        if (anchor_build_sam_tag(anchor_runtime,
+                                 read_seq,
+                                 read_len,
+                                 &anchor_info,
+                                 anchor_sam_tag,
+                                 sizeof(anchor_sam_tag)) == 0) {
+            have_anchor_sam_tag = 1;
         }
         search_seq = read_seq + anchor_insert_start;
         search_len = anchor_insert_len;
@@ -121,7 +411,12 @@ int readseq_process_one_read(const char *read_name,
         find_kmer_bitset(search_seq, search_len, seed_index, seed_mm, &hits);
         if (hits.n == 0) {
             if (sam_out && sam_emit_unmapped) {
-                sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len);
+                sam_write_unmapped(sam_out,
+                                   read_name,
+                                   read_seq,
+                                   read_qual,
+                                   read_len,
+                                   have_anchor_sam_tag ? anchor_sam_tag : NULL);
             }
             goto cleanup;
         }
@@ -144,7 +439,12 @@ int readseq_process_one_read(const char *read_name,
         size_t anchor_hits = kh_size(matches);
         if (anchor_hits == 0) {
             if (sam_out && sam_emit_unmapped) {
-                sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len);
+                sam_write_unmapped(sam_out,
+                                   read_name,
+                                   read_seq,
+                                   read_qual,
+                                   read_len,
+                                   have_anchor_sam_tag ? anchor_sam_tag : NULL);
             }
             goto cleanup;
         }
@@ -207,6 +507,9 @@ int readseq_process_one_read(const char *read_name,
             if (hits.n > 0) {
                 const char *full_read_qual =
                     (read_qual && strlen(read_qual) == read_len) ? read_qual : NULL;
+                if (have_anchor_info && have_anchor_sam_tag) {
+                    kmer_set_sam_optional_tag_override(anchor_sam_tag);
+                }
                 kmer_set_sam_read_override(read_seq,
                                            full_read_qual,
                                            (int)read_len,
@@ -225,6 +528,7 @@ int readseq_process_one_read(const char *read_name,
                                     sam_out,
                                     sam_soft_clip,
                                     0);
+                if (have_anchor_info && have_anchor_sam_tag) kmer_clear_sam_optional_tag_override();
                 kmer_clear_sam_read_override();
             }
         }
@@ -234,7 +538,7 @@ int readseq_process_one_read(const char *read_name,
 
         if (hits.n == 0) {
             if (sam_out && sam_emit_unmapped) {
-                sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len);
+                sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len, NULL);
             }
             goto cleanup;
         }
@@ -255,7 +559,7 @@ int readseq_process_one_read(const char *read_name,
                             0);
 
         if (sam_out && kh_size(matches) == 0 && sam_emit_unmapped) {
-            sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len);
+            sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len, NULL);
         }
     }
 
@@ -270,6 +574,7 @@ int readseq_process_one_read(const char *read_name,
 
 cleanup:
     kmer_clear_sam_read_override();
+    kmer_clear_sam_optional_tag_override();
     if (sam_matches) {
         strset_clear_with_keys(sam_matches);
         kh_destroy(strset, sam_matches);

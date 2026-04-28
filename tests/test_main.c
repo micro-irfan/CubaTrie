@@ -336,6 +336,55 @@ static void test_find_matches_seeded_sam_override_soft_clip(void) {
     trie_free_node(root);
 }
 
+static void test_find_matches_seeded_sam_optional_tag_override(void) {
+    TrieNode *root = trie_create_node();
+    assert(root != NULL);
+    assert(trie_insert(root, "ACGT", "ref1", 0) == TRIE_INSERT_OK);
+
+    KmerBitset *index = kmer_bitset_from_trie(root, 4);
+    assert(index != NULL);
+
+    u32vec_t hit;
+    kv_init(hit);
+    find_kmer_bitset("ACGT", 4, index, 0, &hit);
+    assert(hit.n == 1);
+    assert(hit.a[0] == 0);
+
+    khash_t(strset) *found = kh_init(strset);
+    assert(found != NULL);
+
+    FILE *fp = tmpfile();
+    assert(fp != NULL);
+
+    kmer_set_sam_optional_tag_override("\tZA:Z:ori=FWD;ins=1,4;a5=1-2,ed=0,md=2");
+    find_matches_seeded("ACGT",
+                        4,
+                        &hit,
+                        4,
+                        4,
+                        index,
+                        0,
+                        found,
+                        0,
+                        "readAnchorTag",
+                        NULL,
+                        fp,
+                        0,
+                        0);
+    kmer_clear_sam_optional_tag_override();
+
+    char *sam = read_tmpfile_all(fp);
+    assert(sam != NULL);
+    assert(strstr(sam, "readAnchorTag\t0\tref1\t1\t255\t4M\t*\t0\t0\tACGT\t*\tNM:i:0\tMD:Z:4\tZA:Z:ori=FWD;ins=1,4;a5=1-2,ed=0,md=2\n") != NULL);
+
+    free(sam);
+    fclose(fp);
+    kv_destroy(hit);
+    free_strset_keys_and_destroy(found);
+    kmer_bitset_destroy(index);
+    trie_free_node(root);
+}
+
 static void test_sam_header_strip_and_dedupe(void) {
     TrieNode *root = trie_create_node();
     assert(root != NULL);
@@ -366,6 +415,7 @@ static void test_anchor_extract_window_variants(void) {
     AnchorConfig cfg = {0};
     AnchorRuntime ar = {0};
     size_t start = 0, len = 0;
+    AnchorWindowInfo info = {0};
 
     assert(anchor_runtime_init_range(&ar, &cfg, 3, 3) == 0); // disabled config is a no-op
     assert(anchor_extract_window_range(&ar, "ACGT", 4, &start, &len) == -1);
@@ -378,18 +428,32 @@ static void test_anchor_extract_window_variants(void) {
     assert(anchor_runtime_init_range(&ar, &cfg, 3, 3) == 0);
 
     // Forward orientation: anchor5 ... payload ... anchor3.
-    assert(anchor_extract_window_range(&ar, "CCAGTCGATTCCAGG", 15, &start, &len) == 0);
+    assert(anchor_extract_window_range_info(&ar, "CCAGTCGATTCCAGG", 15, &start, &len, &info) == 0);
     assert(start == 6);
     assert(len == 3);
+    assert(info.orientation == ANCHOR_ORIENT_FWD);
+    assert(info.has_anchor5 == 1);
+    assert(info.anchor5_start == 2);
+    assert(info.anchor5_end == 6);
+    assert(info.has_anchor3 == 1);
+    assert(info.anchor3_start == 9);
+    assert(info.anchor3_end == 13);
     assert(strncmp("CCAGTCGATTCCAGG" + start, "GAT", len) == 0);
     assert(anchor_extract_window(&ar, "CCAGTCGATTCCAGG", 15, &start, &len) == 0);
     assert(start == 6);
     assert(len == 3);
 
     // Reverse-complement orientation: anchor3_rc ... payload ... anchor5_rc.
-    assert(anchor_extract_window_range(&ar, "AATGGACATGACTCC", 15, &start, &len) == 0);
+    assert(anchor_extract_window_range_info(&ar, "AATGGACATGACTCC", 15, &start, &len, &info) == 0);
     assert(start == 6);
     assert(len == 3);
+    assert(info.orientation == ANCHOR_ORIENT_RC);
+    assert(info.has_anchor5 == 1);
+    assert(info.anchor5_start == 9);
+    assert(info.anchor5_end == 13);
+    assert(info.has_anchor3 == 1);
+    assert(info.anchor3_start == 2);
+    assert(info.anchor3_end == 6);
     assert(strncmp("AATGGACATGACTCC" + start, "CAT", len) == 0);
 
     // Ambiguous: repeated 5' anchor should be rejected.
@@ -513,6 +577,7 @@ int main(void) {
     test_find_matches_md_tag();
     test_find_matches_seeded_sam_override_hard_clip();
     test_find_matches_seeded_sam_override_soft_clip();
+    test_find_matches_seeded_sam_optional_tag_override();
     test_sam_header_strip_and_dedupe();
     test_anchor_extract_window_variants();
     test_anchor_extract_window_realworld_mm_indel();

@@ -78,6 +78,8 @@ void kmer_set_sam_read_override(
     int seq_len,
     int clip_left
 );
+void kmer_set_sam_optional_tag_override(const char *tag_text);
 void kmer_clear_sam_read_override(void);
+void kmer_clear_sam_optional_tag_override(void);
 
 #endif
