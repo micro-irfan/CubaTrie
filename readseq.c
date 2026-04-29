@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -100,6 +101,185 @@ static int anchor_tag_buf_append_size(char *buf, size_t cap, size_t *len, size_t
     }
     *len += n;
     buf[*len] = '\0';
+    return 0;
+}
+
+typedef struct {
+    int found;
+    size_t start;
+    size_t end;
+    int errors;
+} AnchorFailDiag;
+
+static int anchor_compute_md(const char *ref_seq,
+                             size_t ref_len,
+                             const char *read_seq,
+                             size_t read_len,
+                             char *md_out,
+                             size_t md_cap);
+
+static const char *anchor_status_text(int configured, int searched, int detected) {
+    if (!configured) return "na";
+    if (!searched) return "na";
+    return detected ? "pass" : "fail";
+}
+
+static int anchor_append_status_segment(const AnchorRuntime *ar,
+                                        const AnchorWindowInfo *info,
+                                        int searched_anchor5,
+                                        int searched_anchor3,
+                                        char *tag_out,
+                                        size_t tag_cap,
+                                        size_t *len) {
+    if (!tag_out || !len) return -1;
+    int cfg5 = (ar && ar->has_anchor5) ? 1 : 0;
+    int cfg3 = (ar && ar->has_anchor3) ? 1 : 0;
+    int det5 = (info && info->has_anchor5) ? 1 : 0;
+    int det3 = (info && info->has_anchor3) ? 1 : 0;
+    const char *s5 = anchor_status_text(cfg5, searched_anchor5, det5);
+    const char *s3 = anchor_status_text(cfg3, searched_anchor3, det3);
+
+    if (anchor_tag_buf_append_cstr(tag_out, tag_cap, len, ";ast=5:") != 0) return -1;
+    if (anchor_tag_buf_append_cstr(tag_out, tag_cap, len, s5) != 0) return -1;
+    if (anchor_tag_buf_append_cstr(tag_out, tag_cap, len, ",3:") != 0) return -1;
+    if (anchor_tag_buf_append_cstr(tag_out, tag_cap, len, s3) != 0) return -1;
+    return 0;
+}
+
+static int anchor_find_best_alignment_anywhere(const char *anchor_seq,
+                                               size_t anchor_len,
+                                               const char *read_seq,
+                                               size_t read_len,
+                                               AnchorFailDiag *out) {
+    if (!anchor_seq || !read_seq || !out) return -1;
+    if (anchor_len == 0 || anchor_len > 63) return -1;
+
+    int prev_buf[64];
+    int curr_buf[64];
+    size_t prev_start_buf[64];
+    size_t curr_start_buf[64];
+    int *prev = prev_buf;
+    int *curr = curr_buf;
+    size_t *prev_start = prev_start_buf;
+    size_t *curr_start = curr_start_buf;
+
+    for (size_t i = 0; i <= anchor_len; ++i) {
+        prev[i] = (int)i;
+        prev_start[i] = 0;
+    }
+
+    out->found = 0;
+    out->start = 0;
+    out->end = 0;
+    out->errors = (int)anchor_len;
+    size_t best_span_diff = anchor_len;
+
+    for (size_t col = 1; col <= read_len; ++col) {
+        curr[0] = 0;
+        curr_start[0] = col;
+        unsigned char tc = (unsigned char)toupper((unsigned char)read_seq[col - 1]);
+
+        for (size_t row = 1; row <= anchor_len; ++row) {
+            int cost = (tc == (unsigned char)toupper((unsigned char)anchor_seq[row - 1])) ? 0 : 1;
+            int sub = prev[row - 1] + cost;
+            int ins = prev[row] + 1;
+            int del = curr[row - 1] + 1;
+
+            int best = sub;
+            size_t best_start = prev_start[row - 1];
+            if (ins < best || (ins == best && prev_start[row] < best_start)) {
+                best = ins;
+                best_start = prev_start[row];
+            }
+            if (del < best || (del == best && curr_start[row - 1] < best_start)) {
+                best = del;
+                best_start = curr_start[row - 1];
+            }
+            curr[row] = best;
+            curr_start[row] = best_start;
+        }
+
+        size_t cand_start = curr_start[anchor_len];
+        size_t cand_end = col;
+        size_t cand_len = (cand_end > cand_start) ? (cand_end - cand_start) : 0;
+        size_t cand_span_diff = (cand_len > anchor_len) ? (cand_len - anchor_len) : (anchor_len - cand_len);
+        int cand_err = curr[anchor_len];
+
+        if (!out->found ||
+            cand_err < out->errors ||
+            (cand_err == out->errors && cand_start < out->start) ||
+            (cand_err == out->errors && cand_start == out->start && cand_span_diff < best_span_diff) ||
+            (cand_err == out->errors && cand_start == out->start && cand_span_diff == best_span_diff && cand_end < out->end)) {
+            out->found = 1;
+            out->start = cand_start;
+            out->end = cand_end;
+            out->errors = cand_err;
+            best_span_diff = cand_span_diff;
+        }
+
+        int *tmp_i = prev;
+        prev = curr;
+        curr = tmp_i;
+        size_t *tmp_s = prev_start;
+        prev_start = curr_start;
+        curr_start = tmp_s;
+    }
+    return out->found ? 0 : 1;
+}
+
+static int anchor_append_failed_detail(const AnchorRuntime *ar,
+                                       const char *read_seq,
+                                       size_t read_len,
+                                       const AnchorWindowInfo *info,
+                                       int have_info,
+                                       int searched_anchor5,
+                                       int searched_anchor3,
+                                       char *tag_out,
+                                       size_t tag_cap,
+                                       size_t *len) {
+    if (!ar || !read_seq || !tag_out || !len) return -1;
+
+    if (ar->has_anchor5 && searched_anchor5 && (!have_info || !info || !info->has_anchor5)) {
+        const char *a5_ref = (have_info && info && info->orientation == ANCHOR_ORIENT_RC) ? ar->a5_rc.seq : ar->a5.seq;
+        AnchorFailDiag d = {0};
+        if (anchor_find_best_alignment_anywhere(a5_ref, strlen(a5_ref), read_seq, read_len, &d) == 0 && d.end <= read_len) {
+            char md[256];
+            size_t seg_len = (d.end >= d.start) ? (d.end - d.start) : 0;
+            if (anchor_compute_md(a5_ref, strlen(a5_ref), read_seq + d.start, seg_len, md, sizeof(md)) == 0) {
+                if (anchor_tag_buf_append_cstr(tag_out, tag_cap, len, ";a5f=") != 0) return -1;
+                if (anchor_tag_buf_append_size(tag_out, tag_cap, len, d.start + 1) != 0) return -1;
+                if (anchor_tag_buf_append_char(tag_out, tag_cap, len, '-') != 0) return -1;
+                if (anchor_tag_buf_append_size(tag_out, tag_cap, len, d.end) != 0) return -1;
+                if (anchor_tag_buf_append_cstr(tag_out, tag_cap, len, ",len=") != 0) return -1;
+                if (anchor_tag_buf_append_size(tag_out, tag_cap, len, seg_len) != 0) return -1;
+                if (anchor_tag_buf_append_cstr(tag_out, tag_cap, len, ",ed=") != 0) return -1;
+                if (anchor_tag_buf_append_size(tag_out, tag_cap, len, (size_t)((d.errors < 0) ? 0 : d.errors)) != 0) return -1;
+                if (anchor_tag_buf_append_cstr(tag_out, tag_cap, len, ",md=") != 0) return -1;
+                if (anchor_tag_buf_append_cstr(tag_out, tag_cap, len, md) != 0) return -1;
+            }
+        }
+    }
+
+    if (ar->has_anchor3 && searched_anchor3 && (!have_info || !info || !info->has_anchor3)) {
+        const char *a3_ref = (have_info && info && info->orientation == ANCHOR_ORIENT_RC) ? ar->a3_rc.seq : ar->a3.seq;
+        AnchorFailDiag d = {0};
+        if (anchor_find_best_alignment_anywhere(a3_ref, strlen(a3_ref), read_seq, read_len, &d) == 0 && d.end <= read_len) {
+            char md[256];
+            size_t seg_len = (d.end >= d.start) ? (d.end - d.start) : 0;
+            if (anchor_compute_md(a3_ref, strlen(a3_ref), read_seq + d.start, seg_len, md, sizeof(md)) == 0) {
+                if (anchor_tag_buf_append_cstr(tag_out, tag_cap, len, ";a3f=") != 0) return -1;
+                if (anchor_tag_buf_append_size(tag_out, tag_cap, len, d.start + 1) != 0) return -1;
+                if (anchor_tag_buf_append_char(tag_out, tag_cap, len, '-') != 0) return -1;
+                if (anchor_tag_buf_append_size(tag_out, tag_cap, len, d.end) != 0) return -1;
+                if (anchor_tag_buf_append_cstr(tag_out, tag_cap, len, ",len=") != 0) return -1;
+                if (anchor_tag_buf_append_size(tag_out, tag_cap, len, seg_len) != 0) return -1;
+                if (anchor_tag_buf_append_cstr(tag_out, tag_cap, len, ",ed=") != 0) return -1;
+                if (anchor_tag_buf_append_size(tag_out, tag_cap, len, (size_t)((d.errors < 0) ? 0 : d.errors)) != 0) return -1;
+                if (anchor_tag_buf_append_cstr(tag_out, tag_cap, len, ",md=") != 0) return -1;
+                if (anchor_tag_buf_append_cstr(tag_out, tag_cap, len, md) != 0) return -1;
+            }
+        }
+    }
     return 0;
 }
 
@@ -227,6 +407,13 @@ static int anchor_build_sam_tag(const AnchorRuntime *ar,
     if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, info->insert_start + 1) != 0) return -1;
     if (anchor_tag_buf_append_char(tag_out, tag_cap, &len, ',') != 0) return -1;
     if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, info->insert_len) != 0) return -1;
+    if (anchor_append_status_segment(ar,
+                                     info,
+                                     ar ? ar->has_anchor5 : 0,
+                                     ar ? ar->has_anchor3 : 0,
+                                     tag_out,
+                                     tag_cap,
+                                     &len) != 0) return -1;
 
     if (info->has_anchor5) {
         if (info->anchor5_end < info->anchor5_start) return -1;
@@ -276,7 +463,13 @@ static int anchor_build_partial_two_sided_start_sam_tag(const AnchorRuntime *ar,
     if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, "\tZA:Z:ori=") != 0) return -1;
     if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len,
                                    info->orientation == ANCHOR_ORIENT_RC ? "RC" : "FWD") != 0) return -1;
-    if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ";partial=1;") != 0) return -1;
+    if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ";partial=1") != 0) return -1;
+    // In two-sided partial fallback, one start anchor is found but paired-anchor
+    // detection was attempted first. Report the opposite side as searched+failed.
+    int searched5 = (ar && ar->has_anchor5) ? 1 : 0;
+    int searched3 = (ar && ar->has_anchor3) ? 1 : 0;
+    if (anchor_append_status_segment(ar, info, searched5, searched3, tag_out, tag_cap, &len) != 0) return -1;
+    if (anchor_tag_buf_append_char(tag_out, tag_cap, &len, ';') != 0) return -1;
 
     if (info->orientation == ANCHOR_ORIENT_FWD && info->has_anchor5) {
         if (info->anchor5_end < info->anchor5_start || info->anchor5_end > read_len) return -1;
@@ -293,6 +486,16 @@ static int anchor_build_partial_two_sided_start_sam_tag(const AnchorRuntime *ar,
         if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, (size_t)((info->anchor5_errors < 0) ? 0 : info->anchor5_errors)) != 0) return -1;
         if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ",md=") != 0) return -1;
         if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, md) != 0) return -1;
+        if (anchor_append_failed_detail(ar,
+                                        read_seq,
+                                        read_len,
+                                        info,
+                                        1,
+                                        searched5,
+                                        searched3,
+                                        tag_out,
+                                        tag_cap,
+                                        &len) != 0) return -1;
         return 0;
     }
 
@@ -311,6 +514,16 @@ static int anchor_build_partial_two_sided_start_sam_tag(const AnchorRuntime *ar,
         if (anchor_tag_buf_append_size(tag_out, tag_cap, &len, (size_t)((info->anchor3_errors < 0) ? 0 : info->anchor3_errors)) != 0) return -1;
         if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, ",md=") != 0) return -1;
         if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, md) != 0) return -1;
+        if (anchor_append_failed_detail(ar,
+                                        read_seq,
+                                        read_len,
+                                        info,
+                                        1,
+                                        searched5,
+                                        searched3,
+                                        tag_out,
+                                        tag_cap,
+                                        &len) != 0) return -1;
         return 0;
     }
 
@@ -322,6 +535,8 @@ static int anchor_build_unmapped_reason_tag(const AnchorRuntime *ar,
                                             size_t read_len,
                                             const AnchorWindowInfo *info,
                                             int have_info,
+                                            int searched_anchor5,
+                                            int searched_anchor3,
                                             const char *reason,
                                             size_t expected_len,
                                             char *tag_out,
@@ -348,6 +563,13 @@ static int anchor_build_unmapped_reason_tag(const AnchorRuntime *ar,
         if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, "reason=") != 0) return -1;
     }
     if (anchor_tag_buf_append_cstr(tag_out, tag_cap, &len, reason) != 0) return -1;
+    if (anchor_append_status_segment(ar,
+                                     have_info ? info : NULL,
+                                     searched_anchor5,
+                                     searched_anchor3,
+                                     tag_out,
+                                     tag_cap,
+                                     &len) != 0) return -1;
 
     // Optional anchor-level detail block for diagnostics when both anchors were found.
     if (have_info && info && ar && read_seq) {
@@ -389,6 +611,16 @@ static int anchor_build_unmapped_reason_tag(const AnchorRuntime *ar,
             }
         }
     }
+    if (anchor_append_failed_detail(ar,
+                                    read_seq,
+                                    read_len,
+                                    info,
+                                    have_info,
+                                    searched_anchor5,
+                                    searched_anchor3,
+                                    tag_out,
+                                    tag_cap,
+                                    &len) != 0) return -1;
     return 0;
 }
 
@@ -419,7 +651,7 @@ int readseq_process_one_read(const char *read_name,
                              int counts_preseeded) {
     int status = 0;
     FILE *sam_out = sam_fp;
-    kvec_t(uint32_t) hits;
+    u32vec_t hits;
     kv_init(hits);
     khash_t(strset) *matches = NULL;
     khash_t(strset) *sam_matches = NULL;
@@ -464,6 +696,8 @@ int readseq_process_one_read(const char *read_name,
                                                                  read_len,
                                                                  &best_pair_info,
                                                                  1,
+                                                                 1,
+                                                                 1,
                                                                  "anchor_ambiguous",
                                                                  min_len,
                                                                  partial_anchor_tag,
@@ -479,6 +713,8 @@ int readseq_process_one_read(const char *read_name,
                                                                  read_len,
                                                                  &best_pair_info,
                                                                  1,
+                                                                 1,
+                                                                 1,
                                                                  len_reason,
                                                                  min_len,
                                                                  partial_anchor_tag,
@@ -490,6 +726,8 @@ int readseq_process_one_read(const char *read_name,
                                                                      read_seq,
                                                                      read_len,
                                                                      &best_pair_info,
+                                                                     1,
+                                                                     1,
                                                                      1,
                                                                      "anchor_window_rejected",
                                                                      min_len,
@@ -514,6 +752,20 @@ int readseq_process_one_read(const char *read_name,
                                                                  &partial_info,
                                                                  partial_anchor_tag,
                                                                  sizeof(partial_anchor_tag)) == 0) {
+                    partial_tag = partial_anchor_tag;
+                }
+                if (!partial_tag &&
+                    anchor_build_unmapped_reason_tag(anchor_runtime,
+                                                     read_seq,
+                                                     read_len,
+                                                     NULL,
+                                                     0,
+                                                     anchor_runtime->has_anchor5 ? 1 : 0,
+                                                     (anchor_runtime->has_anchor3 && !anchor_runtime->has_anchor5) ? 1 : 0,
+                                                     "anchor_not_found",
+                                                     min_len,
+                                                     partial_anchor_tag,
+                                                     sizeof(partial_anchor_tag)) == 0) {
                     partial_tag = partial_anchor_tag;
                 }
                 sam_write_unmapped(sam_out, read_name, read_seq, read_qual, read_len, partial_tag);

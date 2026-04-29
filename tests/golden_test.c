@@ -143,6 +143,19 @@ static int write_test_fastq_anchor_partial_a5_case_gz(const char *path) {
     return ok;
 }
 
+static int write_test_fastq_anchor_not_found_case_gz(const char *path) {
+    gzFile fp = gzopen(path, "wb");
+    if (!fp) return 1;
+    const char *fastq =
+        "@r_anchor_not_found\n"
+        "TTTTTTTT\n"
+        "+\n"
+        "IIIIIIII\n";
+    int ok = (gzputs(fp, fastq) >= 0) ? 0 : 1;
+    gzclose(fp);
+    return ok;
+}
+
 static int run_sam_unmapped_case(const char *reads_path,
                                  const char *sam_path,
                                  int sam_emit_unmapped,
@@ -477,7 +490,7 @@ static int test_anchor_unmapped_includes_za_tag(void) {
         return 1;
     }
 
-    if (strstr(sam_txt, "r_anchor_unmapped\t4\t*\t0\t0\t*\t*\t0\t0\tGGGGTTTT\tIIIIIIII\tZA:Z:ori=FWD;ins=5,4;a5=1-4,ed=0,md=4\n") == NULL) {
+    if (strstr(sam_txt, "r_anchor_unmapped\t4\t*\t0\t0\t*\t*\t0\t0\tGGGGTTTT\tIIIIIIII\tZA:Z:ori=FWD;ins=5,4;ast=5:pass,3:na;a5=1-4,ed=0,md=4\n") == NULL) {
         fprintf(stderr, "MISMATCH: expected unmapped anchor SAM record with ZA tag.\n");
         failed = 1;
     }
@@ -559,8 +572,98 @@ static int test_two_sided_partial_start_anchor_tag(void) {
         return 1;
     }
 
-    if (strstr(sam_txt, "r_anchor_partial_a5\t4\t*\t0\t0\t*\t*\t0\t0\tGGGGTTTTAAAA\tIIIIIIIIIIII\tZA:Z:ori=FWD;partial=1;a5=1-4,ed=0,md=4\n") == NULL) {
-        fprintf(stderr, "MISMATCH: expected two-sided partial start anchor ZA tag on unmapped SAM.\n");
+    if (strstr(sam_txt, "r_anchor_partial_a5\t4\t*\t0\t0\t*\t*\t0\t0\tGGGGTTTTAAAA\tIIIIIIIIIIII\tZA:Z:ori=FWD;partial=1;ast=5:pass,3:fail;a5=1-4,ed=0,md=4;a3f=") == NULL) {
+        fprintf(stderr, "MISMATCH: expected two-sided partial start anchor ZA tag with failed-anchor metadata on unmapped SAM.\n");
+        failed = 1;
+    }
+    if (strstr(sam_txt, ",len=") == NULL || strstr(sam_txt, ",ed=") == NULL || strstr(sam_txt, ",md=") == NULL) {
+        fprintf(stderr, "MISMATCH: expected len/ed/md fields in partial failed-anchor metadata.\n");
+        failed = 1;
+    }
+
+    free(sam_txt);
+    counter_free(map);
+    trie_free_node(root);
+    remove(reads_path);
+    remove(sam_path);
+    return failed;
+}
+
+static int test_anchor_not_found_includes_failed_anchor_metadata(void) {
+    const char *reads_path = "tests/golden/tmp.anchor_not_found.fastq.gz";
+    const char *sam_path = "tests/golden/tmp.anchor_not_found.sam";
+    int failed = 0;
+
+    if (write_test_fastq_anchor_not_found_case_gz(reads_path) != 0) {
+        fprintf(stderr, "ERROR: failed to write anchor-not-found FASTQ fixture: %s\n", reads_path);
+        return 1;
+    }
+
+    TrieNode *root = trie_create_node();
+    kh_counter_t *map = kh_init(counter);
+    if (!root || !map) {
+        if (root) trie_free_node(root);
+        if (map) kh_destroy(counter, map);
+        remove(reads_path);
+        return 1;
+    }
+    if (trie_insert(root, "ACGT", "refA", 0) != TRIE_INSERT_OK) {
+        counter_free(map);
+        trie_free_node(root);
+        remove(reads_path);
+        return 1;
+    }
+    if (counter_add_with_init(map, "refA", 0, 0) != 0) {
+        counter_free(map);
+        trie_free_node(root);
+        remove(reads_path);
+        return 1;
+    }
+
+    FILE *sam_fp = fopen(sam_path, "w");
+    if (!sam_fp) {
+        counter_free(map);
+        trie_free_node(root);
+        remove(reads_path);
+        return 1;
+    }
+    trie_write_sam_header(sam_fp, root);
+
+    AnchorConfig anchor_cfg = {0};
+    anchor_cfg.enabled = 1;
+    anchor_cfg.anchor5 = "GGGG";
+    anchor_cfg.anchor3 = "CCCC";
+    anchor_cfg.max_error = 0;
+
+    size_t min_len = 4, max_len = 4;
+    int rc = load_fastq(reads_path, root, map, 4, 0, &min_len, &max_len, 0, 0,
+                        sam_fp, 0, 1, 1, &anchor_cfg);
+    fclose(sam_fp);
+    if (rc != 0) {
+        counter_free(map);
+        trie_free_node(root);
+        remove(reads_path);
+        remove(sam_path);
+        return 1;
+    }
+
+    size_t sam_len = 0;
+    char *sam_txt = read_text_normalized(sam_path, &sam_len);
+    (void)sam_len;
+    if (!sam_txt) {
+        counter_free(map);
+        trie_free_node(root);
+        remove(reads_path);
+        remove(sam_path);
+        return 1;
+    }
+
+    if (strstr(sam_txt, "r_anchor_not_found\t4\t*\t0\t0\t*\t*\t0\t0\tTTTTTTTT\tIIIIIIII\tZA:Z:reason=anchor_not_found;ast=5:fail,3:na;a5f=") == NULL) {
+        fprintf(stderr, "MISMATCH: expected anchor_not_found ZA status with failed-anchor metadata prefix.\n");
+        failed = 1;
+    }
+    if (strstr(sam_txt, ",len=") == NULL || strstr(sam_txt, ",ed=") == NULL || strstr(sam_txt, ",md=") == NULL) {
+        fprintf(stderr, "MISMATCH: expected len/ed/md fields in failed-anchor metadata.\n");
         failed = 1;
     }
 
@@ -578,6 +681,7 @@ int main(void) {
     if (test_anchor_sam_nh_consistency() != 0) return 1;
     if (test_anchor_unmapped_includes_za_tag() != 0) return 1;
     if (test_two_sided_partial_start_anchor_tag() != 0) return 1;
+    if (test_anchor_not_found_includes_failed_anchor_metadata() != 0) return 1;
 
     const char *ref_path = "tests/golden/ref.fa";
     const char *reads_path = "tests/golden/reads.fastq.gz";

@@ -84,9 +84,6 @@ static inline char kmer2bit(uint64_t code, int k, size_t i) {
 }
 
 
-static inline uint32_t get2(const uint64_t *text, size_t i);
-static inline int isN(const uint64_t *mask, size_t i);
-
 // Map ASCII to 2-bit: A=0,C=1,G=2,T/U=3; return -1 for N/ambiguous
 static inline int nt2bits(char c) {
     switch (c & ~32) { 

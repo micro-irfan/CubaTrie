@@ -74,7 +74,7 @@ fastp \
 | `--exclude-multihit` | Exclude reads with more than one reference hit from final counting (SAM output unaffected). | off |
 | `-a`, `--anchors STR` | Enable anchor-gated mapping. Format: `5p_adapter...3p_adapter`, `5p_adapter...`, or `...3p_adapter` (A/C/G/T only). | off |
 | `--anchor-error INT` | Allowed anchor edit distance (mismatch + indel together). Range: `0..5`. | `0` |
-| `ZA:Z` (SAM optional tag) | Added in anchor mode; reports insert position in read, orientation (`FWD`/`RC`), and anchor-level edit details including MD-like strings. Present on mapped records and on anchor-detected unmapped (`FLAG 4`) records. | emitted only when `--sam` and `--anchors` are both used |
+| `ZA:Z` (SAM optional tag) | Added in anchor mode; reports insert position, orientation (`FWD`/`RC`), per-anchor status (`ast`), and anchor-level edit details including MD-like strings. Present on mapped records and on unmapped (`FLAG 4`) records in anchor mode. | emitted only when `--sam` and `--anchors` are both used |
 | `-t`, `--threads UINT` | Number of worker threads. | `1` |
 | `-d`, `--dup-policy MODE` | Duplicate reference handling: `error`, `warn`, `ignore`. | `error` |
 | `--no-rc` | Do not add reverse complements of references. | off |
@@ -91,21 +91,24 @@ fastp \
 Expected format (full paired-anchor detection):
 
 ```text
-ZA:Z:ori=<FWD|RC>;ins=<insert_start_1based>,<insert_len>[;a5=<start_1based>-<end_1based>,ed=<int>,md=<MD_like>][;a3=<start_1based>-<end_1based>,ed=<int>,md=<MD_like>]
+ZA:Z:ori=<FWD|RC>;ins=<insert_start_1based>,<insert_len>;ast=5:<pass|fail|na>,3:<pass|fail|na>[;a5=<start_1based>-<end_1based>,ed=<int>,md=<MD_like>][;a3=<start_1based>-<end_1based>,ed=<int>,md=<MD_like>]
 ```
 
 Expected format (two-sided mode partial start-anchor fallback on unmapped reads):
 
 ```text
-ZA:Z:ori=<FWD|RC>;partial=1;a5=<start_1based>-<end_1based>,ed=<int>,md=<MD_like>
-ZA:Z:ori=<FWD|RC>;partial=1;a3rc=<start_1based>-<end_1based>,ed=<int>,md=<MD_like>
+ZA:Z:ori=<FWD|RC>;partial=1;ast=5:<pass|fail|na>,3:<pass|fail|na>;a5=<start_1based>-<end_1based>,ed=<int>,md=<MD_like>
+ZA:Z:ori=<FWD|RC>;partial=1;ast=5:<pass|fail|na>,3:<pass|fail|na>;a3rc=<start_1based>-<end_1based>,ed=<int>,md=<MD_like>
+ZA:Z:ori=<FWD|RC>;partial=1;ast=5:<pass|fail|na>,3:<pass|fail|na>;a5=<...>[;a3f=<start_1based>-<end_1based>,len=<int>,ed=<int>,md=<MD_like>]
+ZA:Z:ori=<FWD|RC>;partial=1;ast=5:<pass|fail|na>,3:<pass|fail|na>;a3rc=<...>[;a5f=<start_1based>-<end_1based>,len=<int>,ed=<int>,md=<MD_like>]
 ```
 
 Expected format (two-sided mode unmapped diagnostics):
 
 ```text
-ZA:Z:ori=<FWD|RC>;ins=<insert_start_1based>,<observed_insert_len>;exp=<reference_len>;reason=<insert_len_lt|insert_len_gt|anchor_ambiguous|anchor_window_rejected>
-ZA:Z:ori=<FWD|RC>;ins=<insert_start_1based>,<observed_insert_len>;exp=<reference_len>;reason=<...>;a5=<start_1based>-<end_1based>,ed=<int>,md=<MD_like>;a3=<start_1based>-<end_1based>,ed=<int>,md=<MD_like>
+ZA:Z:ori=<FWD|RC>;ins=<insert_start_1based>,<observed_insert_len>;exp=<reference_len>;reason=<insert_len_lt|insert_len_gt|anchor_ambiguous|anchor_window_rejected>;ast=5:<pass|fail|na>,3:<pass|fail|na>
+ZA:Z:ori=<FWD|RC>;ins=<insert_start_1based>,<observed_insert_len>;exp=<reference_len>;reason=<...>;ast=5:<pass|fail|na>,3:<pass|fail|na>;a5=<start_1based>-<end_1based>,ed=<int>,md=<MD_like>;a3=<start_1based>-<end_1based>,ed=<int>,md=<MD_like>
+ZA:Z:reason=anchor_not_found;ast=5:<pass|fail|na>,3:<pass|fail|na>;a5f=<start_1based>-<end_1based>,len=<int>,ed=<int>,md=<MD_like>[;a3f=<start_1based>-<end_1based>,len=<int>,ed=<int>,md=<MD_like>]
 ```
 
 Field meaning:
@@ -117,7 +120,10 @@ Field meaning:
 - `a3rc`: reverse-complement 3' anchor start hit (reported only in two-sided fallback mode with `ori=RC`).
 - `partial=1`: indicates two-sided anchor mode fallback where only a start anchor (`a5` or `a3rc`) was confidently detected.
 - `exp`: expected insert/reference length used by `count` mode.
-- `reason`: diagnostic reason for unmapped two-sided anchor attempts.
+- `reason`: diagnostic reason for unmapped anchor attempts.
+- `ast`: anchor status summary where `5` and `3` are each `pass`, `fail`, or `na`.
+- `na` means that anchor was not searched in that diagnostic path (or not configured).
+- `a5f` / `a3f`: best-effort failed-anchor diagnostics with position range, matched segment length, edit distance, and MD-like string.
 - `ed`: anchor edit distance used by anchor matching.
 - `md`: MD-like string comparing read anchor segment against expected anchor sequence (`A/C/G/T`, digits for match runs, `^` for deletions from read relative to anchor).
 
@@ -129,18 +135,19 @@ Notes:
 - In `count` mode, two-sided anchors (`a5...a3`) must bracket an insert whose length matches the reference length.
 - In `count` mode, one-sided anchors keep fixed-length behavior (insert length follows reference length).
 - In two-sided mode, if full pairing fails but a single start anchor is confidently found, unmapped SAM may include `partial=1` with either `a5` or `a3rc`.
-- In two-sided mode, unmapped SAM may include a diagnostic `reason` tag; for length failures it also includes observed `ins` and expected `exp`.
-- Reads without detected anchors do not receive `ZA:Z`.
+- Unmapped SAM in anchor mode includes a diagnostic `reason` when extraction fails.
+- `reason=anchor_not_found` indicates no confident anchor window was recoverable; when available, failed anchors include `a5f`/`a3f` metadata for debugging.
 
 Examples:
 
 ```text
-ZA:Z:ori=FWD;ins=31,20;a5=13-30,ed=0,md=18;a3=51-68,ed=1,md=7A10
-ZA:Z:ori=RC;ins=31,20;a5=55-72,ed=1,md=7A10;a3=9-26,ed=0,md=18
-ZA:Z:ori=FWD;ins=19,20;a5=1-18,ed=0,md=18
-ZA:Z:ori=FWD;ins=31,22;exp=20;reason=insert_len_gt;a5=13-30,ed=0,md=18;a3=53-70,ed=1,md=7A10
-ZA:Z:ori=FWD;partial=1;a5=1-18,ed=0,md=18
-ZA:Z:ori=RC;partial=1;a3rc=3-20,ed=1,md=7A10
+ZA:Z:ori=FWD;ins=31,20;ast=5:pass,3:pass;a5=13-30,ed=0,md=18;a3=51-68,ed=1,md=7A10
+ZA:Z:ori=RC;ins=31,20;ast=5:pass,3:pass;a5=55-72,ed=1,md=7A10;a3=9-26,ed=0,md=18
+ZA:Z:ori=FWD;ins=19,20;ast=5:pass,3:na;a5=1-18,ed=0,md=18
+ZA:Z:ori=FWD;ins=31,22;exp=20;reason=insert_len_gt;ast=5:pass,3:pass;a5=13-30,ed=0,md=18;a3=53-70,ed=1,md=7A10
+ZA:Z:ori=FWD;partial=1;ast=5:pass,3:fail;a5=1-18,ed=0,md=18;a3f=45-62,len=18,ed=3,md=4T5A7
+ZA:Z:ori=RC;partial=1;ast=5:fail,3:pass;a3rc=3-20,ed=1,md=7A10;a5f=51-68,len=18,ed=2,md=5C12
+ZA:Z:reason=anchor_not_found;ast=5:fail,3:na;a5f=2-5,len=4,ed=2,md=0GG0
 ```
 
 ## `cut` Options
