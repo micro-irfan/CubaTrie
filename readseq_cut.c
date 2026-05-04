@@ -52,7 +52,13 @@ typedef struct {
     pthread_mutex_t *out_mtx;
     CutStats stats;
     int status;
+    kh_counter_t *counts;
 } CutWorkerCtx;
+
+typedef struct {
+    const char *sequence;
+    size_t count;
+} CutCountEntry;
 
 static const size_t CUT_TASK_QUEUE_CAPACITY = 4096;
 
@@ -152,6 +158,96 @@ static char *dup_cstr_n(const char *s, size_t n) {
     memcpy(p, s, n);
     p[n] = '\0';
     return p;
+}
+
+static int cut_counter_inc_slice(kh_counter_t *m, const char *seq, size_t len) {
+    if (!m || !seq) return -1;
+    char *owned = dup_cstr_n(seq, len);
+    if (!owned) return -1;
+
+    int ret = 0;
+    khiter_t it = kh_put(counter, m, owned, &ret);
+    if (ret < 0) {
+        free(owned);
+        return -1;
+    }
+    if (ret == 0) {
+        kh_val(m, it) += 1;
+        free(owned);
+    } else {
+        kh_key(m, it) = owned;
+        kh_val(m, it) = 1;
+    }
+    return 0;
+}
+
+static int cut_counter_merge_into(kh_counter_t *dst, const kh_counter_t *src) {
+    if (!dst || !src) return -1;
+    for (khint_t i = kh_begin(src); i != kh_end(src); ++i) {
+        if (!kh_exist(src, i)) continue;
+        if (counter_add_with_init(dst, kh_key(src, i), kh_val(src, i), kh_val(src, i)) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int cmp_cut_count_desc_then_seq_asc(const void *pa, const void *pb) {
+    const CutCountEntry *a = (const CutCountEntry*)pa;
+    const CutCountEntry *b = (const CutCountEntry*)pb;
+    if (a->count != b->count) return (a->count > b->count) ? -1 : 1;
+    return strcmp(a->sequence, b->sequence);
+}
+
+static int cut_write_count_csv_sorted(const kh_counter_t *counts, const char *path) {
+    if (!counts || !path) return -1;
+    FILE *fp = (strcmp(path, "-") == 0) ? stdout : fopen(path, "w");
+    if (!fp) {
+        perror("fopen");
+        return -1;
+    }
+
+    size_t n = 0;
+    for (khint_t i = kh_begin(counts); i != kh_end(counts); ++i) {
+        if (kh_exist(counts, i)) ++n;
+    }
+
+    if (fprintf(fp, "sequence,count\n") < 0) {
+        if (fp != stdout) fclose(fp);
+        return -1;
+    }
+    if (n == 0) {
+        if (fp != stdout) fclose(fp);
+        return 0;
+    }
+
+    CutCountEntry *arr = (CutCountEntry*)malloc(n * sizeof(*arr));
+    if (!arr) {
+        if (fp != stdout) fclose(fp);
+        return -1;
+    }
+
+    size_t j = 0;
+    for (khint_t i = kh_begin(counts); i != kh_end(counts); ++i) {
+        if (!kh_exist(counts, i)) continue;
+        arr[j].sequence = kh_key(counts, i);
+        arr[j].count = kh_val(counts, i);
+        ++j;
+    }
+
+    qsort(arr, n, sizeof(*arr), cmp_cut_count_desc_then_seq_asc);
+
+    for (size_t i = 0; i < n; ++i) {
+        if (fprintf(fp, "%s,%zu\n", arr[i].sequence, arr[i].count) < 0) {
+            free(arr);
+            if (fp != stdout) fclose(fp);
+            return -1;
+        }
+    }
+
+    free(arr);
+    if (fp != stdout) fclose(fp);
+    return 0;
 }
 
 static void cut_task_free(CutTask *task) {
@@ -279,8 +375,9 @@ static int cut_process_record(const AnchorRuntime *ar,
                               size_t qual_len,
                               FastqOut *out,
                               pthread_mutex_t *out_mtx,
-                              CutStats *stats) {
-    if (!ar || !name || !seq || !out || !stats) return -1;
+                              CutStats *stats,
+                              kh_counter_t *counts) {
+    if (!ar || !name || !seq || !stats) return -1;
 
     stats->total++;
     if (!qual || qual_len != len) {
@@ -318,15 +415,26 @@ static int cut_process_record(const AnchorRuntime *ar,
         return 0;
     }
 
-    int wr = 0;
-    if (out_mtx) pthread_mutex_lock(out_mtx);
-    wr = fastq_out_write(out, name, src_seq + start, src_qual + start, trim_len);
-    if (out_mtx) pthread_mutex_unlock(out_mtx);
+    if (out) {
+        int wr = 0;
+        if (out_mtx) pthread_mutex_lock(out_mtx);
+        wr = fastq_out_write(out, name, src_seq + start, src_qual + start, trim_len);
+        if (out_mtx) pthread_mutex_unlock(out_mtx);
+        if (wr != 0) {
+            free(rc_seq);
+            free(rc_qual);
+            return -1;
+        }
+    }
+
+    if (counts && cut_counter_inc_slice(counts, src_seq + start, trim_len) != 0) {
+        free(rc_seq);
+        free(rc_qual);
+        return -1;
+    }
 
     free(rc_seq);
     free(rc_qual);
-    if (wr != 0) return -1;
-
     stats->kept++;
     return 0;
 }
@@ -349,7 +457,8 @@ static void *cut_worker_main(void *arg) {
                                task.qual_len,
                                ctx->out,
                                ctx->out_mtx,
-                               &ctx->stats) != 0) {
+                               &ctx->stats,
+                               ctx->counts) != 0) {
             ctx->status = 1;
             cut_queue_request_abort(ctx->queue);
             cut_task_free(&task);
@@ -365,7 +474,8 @@ static void *cut_worker_main(void *arg) {
 static int cut_fastq_by_anchors_single(const char *in_path,
                                         const char *out_path,
                                         const AnchorRuntime *ar,
-                                        int check_revcomp) {
+                                        int check_revcomp,
+                                        const char *count_out_path) {
     gzFile in_fp = gzopen(in_path, "rb");
     if (!in_fp) {
         perror("gzopen");
@@ -377,12 +487,27 @@ static int cut_fastq_by_anchors_single(const char *in_path,
         return 1;
     }
 
+    int out_opened = 0;
     FastqOut out = {0};
-    if (fastq_out_open(&out, out_path) != 0) {
-        perror("open output");
-        kseq_destroy(ks);
-        gzclose(in_fp);
-        return 1;
+    if (out_path) {
+        if (fastq_out_open(&out, out_path) != 0) {
+            perror("open output");
+            kseq_destroy(ks);
+            gzclose(in_fp);
+            return 1;
+        }
+        out_opened = 1;
+    }
+
+    kh_counter_t *counts = NULL;
+    if (count_out_path) {
+        counts = kh_init(counter);
+        if (!counts) {
+            if (out_opened) fastq_out_close(&out);
+            kseq_destroy(ks);
+            gzclose(in_fp);
+            return 1;
+        }
     }
 
     CutStats stats = {0};
@@ -396,9 +521,10 @@ static int cut_fastq_by_anchors_single(const char *in_path,
                                ks->qual.l ? ks->qual.s : NULL,
                                ks->seq.l,
                                ks->qual.l,
-                               &out,
+                               out_opened ? &out : NULL,
                                NULL,
-                               &stats) != 0) {
+                               &stats,
+                               counts) != 0) {
             status = 1;
             break;
         }
@@ -406,7 +532,12 @@ static int cut_fastq_by_anchors_single(const char *in_path,
 
     if (l < -1) status = 1;
 
-    fastq_out_close(&out);
+    if (status == 0 && counts && cut_write_count_csv_sorted(counts, count_out_path) != 0) {
+        status = 1;
+    }
+
+    if (counts) counter_free(counts);
+    if (out_opened) fastq_out_close(&out);
     kseq_destroy(ks);
     gzclose(in_fp);
 
@@ -420,12 +551,14 @@ static int cut_fastq_by_anchors_mt(const char *in_path,
                                     const char *out_path,
                                     const AnchorRuntime *ar,
                                     int check_revcomp,
-                                    unsigned threads) {
+                                    unsigned threads,
+                                    const char *count_out_path) {
     int status = 0;
     int queue_inited = 0;
     int out_mtx_inited = 0;
     pthread_t *tids = NULL;
     CutWorkerCtx *ctxs = NULL;
+    kh_counter_t *all_counts = NULL;
 
     gzFile in_fp = gzopen(in_path, "rb");
     if (!in_fp) {
@@ -438,17 +571,32 @@ static int cut_fastq_by_anchors_mt(const char *in_path,
         return 1;
     }
 
+    int out_opened = 0;
     FastqOut out = {0};
-    if (fastq_out_open(&out, out_path) != 0) {
-        perror("open output");
-        kseq_destroy(ks);
-        gzclose(in_fp);
-        return 1;
+    if (out_path) {
+        if (fastq_out_open(&out, out_path) != 0) {
+            perror("open output");
+            kseq_destroy(ks);
+            gzclose(in_fp);
+            return 1;
+        }
+        out_opened = 1;
+    }
+
+    if (count_out_path) {
+        all_counts = kh_init(counter);
+        if (!all_counts) {
+            if (out_opened) fastq_out_close(&out);
+            kseq_destroy(ks);
+            gzclose(in_fp);
+            return 1;
+        }
     }
 
     CutTaskQueue queue;
     if (cut_queue_init(&queue, CUT_TASK_QUEUE_CAPACITY) != 0) {
-        fastq_out_close(&out);
+        if (all_counts) counter_free(all_counts);
+        if (out_opened) fastq_out_close(&out);
         kseq_destroy(ks);
         gzclose(in_fp);
         return 1;
@@ -456,11 +604,13 @@ static int cut_fastq_by_anchors_mt(const char *in_path,
     queue_inited = 1;
 
     pthread_mutex_t out_mtx;
-    if (pthread_mutex_init(&out_mtx, NULL) != 0) {
-        status = 1;
-        goto cleanup;
+    if (out_opened) {
+        if (pthread_mutex_init(&out_mtx, NULL) != 0) {
+            status = 1;
+            goto cleanup;
+        }
+        out_mtx_inited = 1;
     }
-    out_mtx_inited = 1;
 
     tids = (pthread_t*)calloc(threads, sizeof(*tids));
     ctxs = (CutWorkerCtx*)calloc(threads, sizeof(*ctxs));
@@ -474,10 +624,19 @@ static int cut_fastq_by_anchors_mt(const char *in_path,
         ctxs[i].queue = &queue;
         ctxs[i].anchor_runtime = ar;
         ctxs[i].check_revcomp = check_revcomp;
-        ctxs[i].out = &out;
-        ctxs[i].out_mtx = &out_mtx;
+        ctxs[i].out = out_opened ? &out : NULL;
+        ctxs[i].out_mtx = out_opened ? &out_mtx : NULL;
         memset(&ctxs[i].stats, 0, sizeof(ctxs[i].stats));
         ctxs[i].status = 0;
+        ctxs[i].counts = NULL;
+        if (count_out_path) {
+            ctxs[i].counts = kh_init(counter);
+            if (!ctxs[i].counts) {
+                status = 1;
+                cut_queue_request_abort(&queue);
+                break;
+            }
+        }
         if (pthread_create(&tids[i], NULL, cut_worker_main, &ctxs[i]) != 0) {
             status = 1;
             cut_queue_request_abort(&queue);
@@ -525,6 +684,14 @@ static int cut_fastq_by_anchors_mt(const char *in_path,
         stats.discarded += ctxs[i].stats.discarded;
         stats.kept_rc += ctxs[i].stats.kept_rc;
         if (ctxs[i].status != 0) status = 1;
+        if (status == 0 && all_counts && ctxs[i].counts &&
+            cut_counter_merge_into(all_counts, ctxs[i].counts) != 0) {
+            status = 1;
+        }
+    }
+
+    if (status == 0 && all_counts && cut_write_count_csv_sorted(all_counts, count_out_path) != 0) {
+        status = 1;
     }
 
     fprintf(stderr,
@@ -532,11 +699,17 @@ static int cut_fastq_by_anchors_mt(const char *in_path,
             stats.total, stats.kept, stats.discarded, stats.kept_rc);
 
 cleanup:
+    if (ctxs) {
+        for (size_t i = 0; i < threads; ++i) {
+            if (ctxs[i].counts) counter_free(ctxs[i].counts);
+        }
+    }
+    if (all_counts) counter_free(all_counts);
     free(tids);
     free(ctxs);
     if (out_mtx_inited) pthread_mutex_destroy(&out_mtx);
     if (queue_inited) cut_queue_destroy(&queue);
-    fastq_out_close(&out);
+    if (out_opened) fastq_out_close(&out);
     kseq_destroy(ks);
     gzclose(in_fp);
     return status;
@@ -548,8 +721,13 @@ int cut_fastq_by_anchors(const char *in_path,
                          size_t min_len,
                          size_t max_len,
                          int check_revcomp,
-                         unsigned threads) {
-    if (!in_path || !out_path || !anchor_cfg || !anchor_cfg->enabled) return 1;
+                         unsigned threads,
+                         const char *count_out_path) {
+    if (!in_path || !anchor_cfg || !anchor_cfg->enabled) return 1;
+    if (!out_path && !count_out_path) {
+        fprintf(stderr, "cut mode requires at least one output: FASTQ (-o/--output) or counts CSV (-c/--count).\n");
+        return 1;
+    }
     if (min_len == 0 || max_len == 0 || min_len > max_len) return 1;
 
     AnchorRuntime ar;
@@ -559,7 +737,7 @@ int cut_fastq_by_anchors(const char *in_path,
     }
 
     if (threads <= 1) {
-        return cut_fastq_by_anchors_single(in_path, out_path, &ar, check_revcomp);
+        return cut_fastq_by_anchors_single(in_path, out_path, &ar, check_revcomp, count_out_path);
     }
-    return cut_fastq_by_anchors_mt(in_path, out_path, &ar, check_revcomp, threads);
+    return cut_fastq_by_anchors_mt(in_path, out_path, &ar, check_revcomp, threads, count_out_path);
 }

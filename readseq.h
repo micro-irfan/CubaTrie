@@ -45,6 +45,7 @@ int cut_fastq_by_anchors(const char *in_path,
                          size_t min_len,
                          size_t max_len,
                          int check_revcomp,
-                         unsigned threads);
+                         unsigned threads,
+                         const char *count_out_path);
 
 #endif

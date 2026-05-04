@@ -34,8 +34,10 @@ typedef struct {
 
 typedef struct {
     const char *in;          // -i/--input
-    const char *out;         // -o/--output (required)
+    const char *out;         // -o/--output FASTQ
+    const char *count_out;   // -c/--count CSV
     int out_explicit;
+    int count_explicit;
     int verbose;
     int anchor_enabled;
     char *anchor5;
@@ -155,8 +157,9 @@ static void usage_cut(const char *prog) {
         "Usage: %s cut [options]\n"
         "Options:\n"
         "  -i, --input FILE        input FASTQ/FA (gz supported) (required)\n"
-        "  -o, --output FILE       output FASTQ path (required)\n"
+        "  -o, --output FILE       output FASTQ path\n"
         "                          if FILE ends with .gz, output is gzip-compressed\n"
+        "  -c, --count FILE        output CSV of kept insert counts (header: sequence,count)\n"
         "  -a, --anchors STR       Anchors: 5p_adapter...3p_adapter, 5p_adapter..., or ...3p_adapter\n"
         "      --anchor-error INT  Allowed adapter edit distance [0..5] (mismatch+indel)\n"
         "  -m, --min INT           minimum trimmed insert length (required)\n"
@@ -336,6 +339,7 @@ static int parse_cut_args(int argc, char **argv, const char *prog, CutOptions *o
     static ko_longopt_t longopts[] = {
         {"input",        ko_required_argument, 'i'},
         {"output",       ko_required_argument, 'o'},
+        {"count",        ko_required_argument, 'c'},
         {"anchors",      ko_required_argument, 'a'},
         {"anchor-error", ko_required_argument, 306},
         {"min",          ko_required_argument, 'm'},
@@ -348,7 +352,9 @@ static int parse_cut_args(int argc, char **argv, const char *prog, CutOptions *o
 
     opt->in = NULL;
     opt->out = NULL;
+    opt->count_out = NULL;
     opt->out_explicit = 0;
+    opt->count_explicit = 0;
     opt->verbose = 0;
     opt->anchor_enabled = 0;
     opt->anchor5 = NULL;
@@ -363,7 +369,7 @@ static int parse_cut_args(int argc, char **argv, const char *prog, CutOptions *o
 
     ketopt_t o = KETOPT_INIT;
     int c;
-    while ((c = ketopt(&o, argc, argv, 1, "i:o:a:m:M:t:vh", longopts)) >= 0) {
+    while ((c = ketopt(&o, argc, argv, 1, "i:o:c:a:m:M:t:vh", longopts)) >= 0) {
         switch (c) {
         case 'i':
             opt->in = o.arg;
@@ -371,6 +377,10 @@ static int parse_cut_args(int argc, char **argv, const char *prog, CutOptions *o
         case 'o':
             opt->out = o.arg;
             opt->out_explicit = 1;
+            break;
+        case 'c':
+            opt->count_out = o.arg;
+            opt->count_explicit = 1;
             break;
         case 'a': {
             char *a5 = NULL, *a3 = NULL;
@@ -442,10 +452,20 @@ static int parse_cut_args(int argc, char **argv, const char *prog, CutOptions *o
         fprintf(stderr, "cut mode does not support stdin input; provide a FASTQ/FASTQ.GZ file path.\n");
         return -20;
     }
-    if (!opt->out_explicit || !opt->out || opt->out[0] == '\0') {
-        fprintf(stderr, "Missing required option: -o/--output\n");
+    if (opt->out_explicit && (!opt->out || opt->out[0] == '\0')) {
+        fprintf(stderr, "Invalid option: -o/--output requires a non-empty path\n");
         usage_cut(prog);
         return -15;
+    }
+    if (opt->count_explicit && (!opt->count_out || opt->count_out[0] == '\0')) {
+        fprintf(stderr, "Invalid option: -c/--count requires a non-empty path\n");
+        usage_cut(prog);
+        return -21;
+    }
+    if (!opt->out_explicit && !opt->count_explicit) {
+        fprintf(stderr, "Missing output: provide -o/--output and/or -c/--count\n");
+        usage_cut(prog);
+        return -22;
     }
     if (!opt->anchor_enabled || (!opt->anchor5 && !opt->anchor3)) {
         fprintf(stderr, "Missing required option: -a/--anchors\n");
@@ -530,12 +550,13 @@ int main(int argc, char **argv) {
         anchor_cfg.max_error = cut.anchor_error;
 
         int rc = cut_fastq_by_anchors(cut.in,
-                                      cut.out,
+                                      cut.out_explicit ? cut.out : NULL,
                                       &anchor_cfg,
                                       cut.min_len,
                                       cut.max_len,
                                       cut.check_revcomp,
-                                      cut.threads);
+                                      cut.threads,
+                                      cut.count_explicit ? cut.count_out : NULL);
         free_anchor_pair(&cut.anchor5, &cut.anchor3);
         return rc == 0 ? 0 : 1;
     }

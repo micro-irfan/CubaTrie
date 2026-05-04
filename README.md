@@ -159,7 +159,8 @@ ZA:Z:reason=anchor_not_found;ast=5:fail,3:na;a5f=2-5,len=4,ed=2,md=0GG0
 | Option | Description | Default |
 |---|---|---|
 | `-i`, `--input FILE` | Input FASTQ/FA (gz supported). | none (required) |
-| `-o`, `--output FILE` | Output FASTQ path. If path ends with `.gz`, output is gzip-compressed. | none (required) |
+| `-o`, `--output FILE` | Output FASTQ path. If path ends with `.gz`, output is gzip-compressed. | optional |
+| `-c`, `--count FILE` | Output CSV of kept insert counts with header `sequence,count` sorted by descending count. Use `-` for stdout. | optional |
 | `-a`, `--anchors STR` | Trimming anchors: `5p_adapter...3p_adapter`, `5p_adapter...`, or `...3p_adapter` (A/C/G/T only). | none (required) |
 | `--anchor-error INT` | Allowed anchor edit distance (mismatch + indel together). Range: `0..5`. | `0` |
 | `-m`, `--min INT` | Minimum insert length to keep after anchor trimming. | none (required) |
@@ -168,6 +169,8 @@ ZA:Z:reason=anchor_not_found;ast=5:fail,3:na;a5f=2-5,len=4,ed=2,md=0GG0
 | `--check-rc` | Retry anchor detection on reverse-complement read and reverse quality accordingly. | off |
 | `-v` | Verbose/debug output (repeatable). | off |
 | `-h`, `--help` | Show help. | off |
+
+At least one of `-o/--output` or `-c/--count` must be provided.
 
 ## Example Commands
 
@@ -210,6 +213,16 @@ ZA:Z:reason=anchor_not_found;ast=5:fail,3:na;a5f=2-5,len=4,ed=2,md=0GG0
 
 # Trim reads based on anchors; keep only inserts with length in [18, 24]
 ./cubaTrie cut -i reads.fastq.gz -o trimmed.fastq.gz \
+  -a GGAAAGGACGAAACACCG...GTTTTAGAGCTAGAAATA \
+  --anchor-error 1 -m 18 -M 24 -t 8
+
+# Trim and emit insert count table sorted by most frequent first
+./cubaTrie cut -i reads.fastq.gz -o trimmed.fastq.gz -c trimmed.counts.csv \
+  -a GGAAAGGACGAAACACCG...GTTTTAGAGCTAGAAATA \
+  --anchor-error 1 -m 18 -M 24 -t 8
+
+# Count-only mode (skip FASTQ output)
+./cubaTrie cut -i reads.fastq.gz -c trimmed.counts.csv \
   -a GGAAAGGACGAAACACCG...GTTTTAGAGCTAGAAATA \
   --anchor-error 1 -m 18 -M 24 -t 8
 
