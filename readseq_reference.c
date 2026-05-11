@@ -111,7 +111,12 @@ int load_reference(const char *path, TrieNode *root, kh_counter_t *map,
             continue;
         }
 
-        counter_inc(map, name_buf);
+        if (counter_add_with_init(map, name_buf, 0, 0) != 0) {
+            free(seq);
+            kseq_destroy(ks);
+            gzclose(fp);
+            return 1;
+        }
         inserted++;
 
         if (add_revcomp) {
@@ -156,7 +161,13 @@ int load_reference(const char *path, TrieNode *root, kh_counter_t *map,
                             return 2;
                         }
                     } else {
-                        counter_inc(map, rcname);
+                        if (counter_add_with_init(map, rcname, 0, 0) != 0) {
+                            free(rc);
+                            free(seq);
+                            kseq_destroy(ks);
+                            gzclose(fp);
+                            return 1;
+                        }
                         inserted++;
                     }
                 }

@@ -38,7 +38,7 @@ void total_hits (const kh_counter_t *m, const size_t nreads) {
     fprintf(stderr, "Finished Processing %zu reads...\n", nreads);
 
     double pct = nreads ? 100.0 * (double)total / (double)nreads : 0.0;
-    fprintf(stderr, "Reads with matches: %zu (%.2f%%)\n", total, pct);
+    fprintf(stderr, "Total counted assignments: %zu (%.2f%% of reads)\n", total, pct);
 }
 
 static _Thread_local khash_t(strset) *tls_matches = NULL;

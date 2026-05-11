@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <ctype.h>
 #include "kmer.h"
 #include "utils.h"
 
@@ -10,6 +11,11 @@ static _Thread_local const char *g_sam_qual_override = NULL;
 static _Thread_local int g_sam_seq_len_override = -1;
 static _Thread_local int g_sam_clip_left_override = 0;
 static _Thread_local const char *g_sam_optional_tag_override = NULL;
+static int g_allow_indel_extension = 0;
+
+void kmer_set_indel_mode(int enabled) {
+    g_allow_indel_extension = enabled ? 1 : 0;
+}
 
 void kmer_set_sam_read_override(
     const char *seq,
@@ -63,8 +69,12 @@ typedef struct {
     const char *ref_name;
     const char *ref_seq;
     size_t match_start;
-    size_t match_len;
+    size_t read_span;
+    size_t ref_span;
     int nm;
+    int indel_count;
+    char *ops;
+    size_t nops;
 } SamAlignmentRecord;
 
 typedef struct {
@@ -143,18 +153,28 @@ static khash_t(posset) *tls_get_start_pos_cache(void) {
     return tls_start_pos_cache;
 }
 
-static int sam_write_cigar(SamTextBuf *sam_buf,
-                           size_t clip_start,
-                           size_t match_len,
-                           size_t clip_end,
-                           int sam_soft_clip) {
+static int sam_write_cigar_from_ops(SamTextBuf *sam_buf,
+                                    size_t clip_start,
+                                    const char *ops,
+                                    size_t nops,
+                                    size_t clip_end,
+                                    int sam_soft_clip) {
+    if (!sam_buf || !ops || nops == 0) return -1;
     char clip_op = sam_soft_clip ? 'S' : 'H';
     if (clip_start > 0) {
         if (sam_buf_append_size(sam_buf, clip_start) != 0) return -1;
         if (sam_buf_append_char(sam_buf, clip_op) != 0) return -1;
     }
-    if (sam_buf_append_size(sam_buf, match_len) != 0) return -1;
-    if (sam_buf_append_char(sam_buf, 'M') != 0) return -1;
+    size_t run = 1;
+    for (size_t i = 1; i <= nops; ++i) {
+        if (i < nops && ops[i] == ops[i - 1]) {
+            run++;
+            continue;
+        }
+        if (sam_buf_append_size(sam_buf, run) != 0) return -1;
+        if (sam_buf_append_char(sam_buf, ops[i - 1]) != 0) return -1;
+        run = 1;
+    }
     if (clip_end > 0) {
         if (sam_buf_append_size(sam_buf, clip_end) != 0) return -1;
         if (sam_buf_append_char(sam_buf, clip_op) != 0) return -1;
@@ -174,29 +194,107 @@ typedef struct {
     const char *name;
     const char *seq;
     size_t seq_len;
-    int mm;
+    int ed;
+    int indel_count;
+    size_t read_span;
+    char *ops;
+    size_t nops;
 } CursorMatch;
 
 typedef kvec_t(CursorMatch) CursorMatchVec;
 
-static int sam_write_md_tag(SamTextBuf *sam_buf,
-                            const char *read_seq,
-                            size_t match_start,
-                            const char *ref_seq,
-                            size_t match_len) {
-    if (!sam_buf || !read_seq || !ref_seq) return -1;
-    if (sam_buf_append_cstr(sam_buf, "\tMD:Z:") != 0) return -1;
-    size_t run = 0;
-    for (size_t i = 0; i < match_len; ++i) {
-        if (read_seq[match_start + i] == ref_seq[i]) {
-            run++;
-        } else {
-            if (sam_buf_append_size(sam_buf, run) != 0) return -1;
-            if (sam_buf_append_char(sam_buf, ref_seq[i]) != 0) return -1;
-            run = 0;
-        }
+typedef struct {
+    char *ops;
+    size_t n;
+    size_t m;
+} AlignPath;
+
+typedef struct {
+    const TrieNode *node;
+    uint8_t edge_idx;
+    uint16_t edge_off;
+} RefCursor;
+
+static inline void clear_cursor_matches_keep_capacity(CursorMatchVec *mv) {
+    if (!mv) return;
+    for (size_t i = 0; i < mv->n; ++i) {
+        free(mv->a[i].ops);
+        mv->a[i].ops = NULL;
+        mv->a[i].nops = 0;
     }
+    mv->n = 0;
+}
+
+static inline void free_sam_records(kvec_t(SamAlignmentRecord) *recs) {
+    if (!recs) return;
+    for (size_t i = 0; i < recs->n; ++i) {
+        free(recs->a[i].ops);
+        recs->a[i].ops = NULL;
+        recs->a[i].nops = 0;
+    }
+}
+
+static int sam_write_md_tag_from_ops(SamTextBuf *sam_buf,
+                                     const char *read_seq,
+                                     size_t match_start,
+                                     size_t read_len,
+                                     const char *ref_seq,
+                                     size_t ref_len,
+                                     const char *ops,
+                                     size_t nops) {
+    if (!sam_buf || !read_seq || !ref_seq || !ops) return -1;
+    if (sam_buf_append_cstr(sam_buf, "\tMD:Z:") != 0) return -1;
+    size_t read_i = match_start;
+    size_t ref_i = 0;
+    size_t run = 0;
+    for (size_t i = 0; i < nops; ++i) {
+        char op = ops[i];
+        if (op == 'M') {
+            if (read_i >= read_len || ref_i >= ref_len) return -1;
+            if (toupper((unsigned char)read_seq[read_i]) == toupper((unsigned char)ref_seq[ref_i])) {
+                run++;
+            } else {
+                if (sam_buf_append_size(sam_buf, run) != 0) return -1;
+                if (sam_buf_append_char(sam_buf, ref_seq[ref_i]) != 0) return -1;
+                run = 0;
+            }
+            read_i++;
+            ref_i++;
+            continue;
+        }
+        if (op == 'I') {
+            if (read_i >= read_len) return -1;
+            read_i++;
+            continue;
+        }
+        if (op == 'D') {
+            if (sam_buf_append_size(sam_buf, run) != 0) return -1;
+            run = 0;
+            if (sam_buf_append_char(sam_buf, '^') != 0) return -1;
+            while (i < nops && ops[i] == 'D') {
+                if (ref_i >= ref_len) return -1;
+                if (sam_buf_append_char(sam_buf, ref_seq[ref_i]) != 0) return -1;
+                ref_i++;
+                i++;
+            }
+            i--;
+            continue;
+        }
+        return -1;
+    }
+    if (ref_i > ref_len || read_i > read_len) return -1;
     return sam_buf_append_size(sam_buf, run);
+}
+
+static int sam_ops_read_span(const char *ops, size_t nops, size_t *out) {
+    if (!ops || !out) return -1;
+    size_t n = 0;
+    for (size_t i = 0; i < nops; ++i) {
+        if (ops[i] == 'M' || ops[i] == 'I') n++;
+        else if (ops[i] != 'D') return -1;
+    }
+    *out = n;
+    return 0;
 }
 
 static int sam_write_alignment(SamTextBuf *sam_buf,
@@ -206,19 +304,23 @@ static int sam_write_alignment(SamTextBuf *sam_buf,
                                size_t read_len,
                                const char *ref_name,
                                const char *ref_seq,
+                               size_t ref_span,
                                size_t match_start,
-                               size_t match_len,
+                               size_t read_span,
                                int nm,
+                               const char *ops,
+                               size_t nops,
                                int nh,
                                int sam_soft_clip,
                                int has_full_qual) {
-    if (!sam_buf || !read_name || !read_seq || !ref_name) return -1;
+    if (!sam_buf || !read_name || !read_seq || !ref_name || !ops || nops == 0) return -1;
     if (match_start >= read_len) return 0;
-    if (match_len > read_len - match_start) match_len = read_len - match_start;
-    if (match_len == 0) return 0;
+    if (sam_ops_read_span(ops, nops, &read_span) != 0) return -1;
+    if (read_span > read_len - match_start) return -1;
+    if (read_span == 0) return 0;
 
     size_t clip_start = match_start;
-    size_t clip_end = read_len - match_start - match_len;
+    size_t clip_end = read_len - match_start - read_span;
 
     int flag = name_is_rev(ref_name) ? 16 : 0;
     size_t qname_len = name_len_no_rc_suffix(read_name);
@@ -231,9 +333,9 @@ static int sam_write_alignment(SamTextBuf *sam_buf,
     if (!sam_soft_clip) {
         // For hard clipping, output only the aligned segment in SEQ/QUAL.
         seq_out = read_seq + match_start;
-        seq_out_len = match_len;
+        seq_out_len = read_span;
         qual_out = read_qual ? (read_qual + match_start) : NULL;
-        qual_out_len = match_len;
+        qual_out_len = read_span;
     }
 
     if (sam_buf_append_mem(sam_buf, read_name, qname_len) != 0) return -1;
@@ -242,7 +344,7 @@ static int sam_write_alignment(SamTextBuf *sam_buf,
     if (sam_buf_append_char(sam_buf, '\t') != 0) return -1;
     if (sam_buf_append_mem(sam_buf, ref_name, rname_len) != 0) return -1;
     if (sam_buf_append_cstr(sam_buf, "\t1\t255\t") != 0) return -1;
-    if (sam_write_cigar(sam_buf, clip_start, match_len, clip_end, sam_soft_clip) != 0) return -1;
+    if (sam_write_cigar_from_ops(sam_buf, clip_start, ops, nops, clip_end, sam_soft_clip) != 0) return -1;
     if (sam_buf_append_cstr(sam_buf, "\t*\t0\t0\t") != 0) return -1;
     if (sam_buf_append_mem(sam_buf, seq_out, seq_out_len) != 0) return -1;
     if (sam_buf_append_char(sam_buf, '\t') != 0) return -1;
@@ -257,7 +359,7 @@ static int sam_write_alignment(SamTextBuf *sam_buf,
         if (sam_buf_append_cstr(sam_buf, "\tNH:i:") != 0) return -1;
         if (sam_buf_append_size(sam_buf, (size_t)nh) != 0) return -1;
     }
-    if (sam_write_md_tag(sam_buf, read_seq, match_start, ref_seq, match_len) != 0) return -1;
+    if (sam_write_md_tag_from_ops(sam_buf, read_seq, match_start, read_len, ref_seq, ref_span, ops, nops) != 0) return -1;
     if (g_sam_optional_tag_override && g_sam_optional_tag_override[0] != '\0') {
         if (sam_buf_append_cstr(sam_buf, g_sam_optional_tag_override) != 0) return -1;
     }
@@ -435,6 +537,195 @@ void find_kmer_bitset(const char *s,
     if (hits->n > 1) qsort(hits->a, hits->n, sizeof(uint32_t), cmp_u32_asc);
 }
 
+static int align_path_push(AlignPath *p, char op) {
+    if (!p) return -1;
+    if (p->n == p->m) {
+        size_t nm = p->m ? (p->m << 1) : 64;
+        char *buf = (char*)realloc(p->ops, nm);
+        if (!buf) return -1;
+        p->ops = buf;
+        p->m = nm;
+    }
+    p->ops[p->n++] = op;
+    return 0;
+}
+
+static void align_path_pop(AlignPath *p) {
+    if (p && p->n > 0) p->n--;
+}
+
+static int cursor_take_ref_base(const RefCursor *cur,
+                                uint8_t edge_choice,
+                                int force_choice,
+                                char *base_out,
+                                RefCursor *next_out) {
+    if (!cur || !base_out || !next_out) return -1;
+    if (cur->edge_idx == CURSOR_AT_NODE) {
+        const char *label = cur->node->edge_label[edge_choice];
+        const TrieNode *child = cur->node->child[edge_choice];
+        if (!label || !child || label[0] == '\0') return -1;
+        *base_out = label[0];
+        next_out->node = cur->node;
+        if (label[1] == '\0') {
+            next_out->node = child;
+            next_out->edge_idx = CURSOR_AT_NODE;
+            next_out->edge_off = 0;
+        } else {
+            next_out->edge_idx = edge_choice;
+            next_out->edge_off = 1;
+        }
+        return 0;
+    }
+
+    if (force_choice && edge_choice != cur->edge_idx) return -1;
+    const char *label = cur->node->edge_label[cur->edge_idx];
+    const TrieNode *child = cur->node->child[cur->edge_idx];
+    if (!label || !child) return -1;
+    size_t lablen = strlen(label);
+    if (cur->edge_off >= lablen) return -1;
+    *base_out = label[cur->edge_off];
+    if (cur->edge_off + 1 >= lablen) {
+        next_out->node = child;
+        next_out->edge_idx = CURSOR_AT_NODE;
+        next_out->edge_off = 0;
+    } else {
+        next_out->node = cur->node;
+        next_out->edge_idx = cur->edge_idx;
+        next_out->edge_off = (uint16_t)(cur->edge_off + 1);
+    }
+    return 0;
+}
+
+static int cursor_match_cmp(const CursorMatch *a, const CursorMatch *b) {
+    if (a->ed != b->ed) return (a->ed < b->ed) ? -1 : 1;
+    if (a->indel_count != b->indel_count) return (a->indel_count < b->indel_count) ? -1 : 1;
+    size_t ad = (a->read_span > a->seq_len) ? (a->read_span - a->seq_len) : (a->seq_len - a->read_span);
+    size_t bd = (b->read_span > b->seq_len) ? (b->read_span - b->seq_len) : (b->seq_len - b->read_span);
+    if (ad != bd) return (ad < bd) ? -1 : 1;
+    if (a->read_span != b->read_span) return (a->read_span < b->read_span) ? -1 : 1;
+    return strcmp(a->name, b->name);
+}
+
+static void cursor_collect_matches_dfs(const char *sequence,
+                                       size_t seq_len,
+                                       size_t start,
+                                       uint32_t min_len,
+                                       uint32_t max_len,
+                                       int k_mm,
+                                       RefCursor cur,
+                                       size_t read_pos,
+                                       size_t ref_consumed,
+                                       int ed_used,
+                                       int indel_used,
+                                       AlignPath *path,
+                                       CursorMatchVec *out) {
+    if (!sequence || !path || !out) return;
+    if (ed_used > k_mm) return;
+    if (read_pos < start || read_pos > seq_len) return;
+    if (ref_consumed > max_len) return;
+    size_t read_span = read_pos - start;
+    size_t read_span_cap = g_allow_indel_extension ? ((size_t)max_len + (size_t)k_mm) : (size_t)max_len;
+    if (read_span > read_span_cap) return;
+
+    if (cur.edge_idx == CURSOR_AT_NODE &&
+        cur.node && cur.node->end &&
+        ref_consumed >= min_len && ref_consumed <= max_len) {
+        CursorMatch cm;
+        cm.name = cur.node->name;
+        cm.seq = cur.node->seq;
+        cm.seq_len = cur.node->seq_len;
+        cm.ed = ed_used;
+        cm.indel_count = indel_used;
+        cm.read_span = read_span;
+        cm.nops = path->n;
+        cm.ops = (char*)malloc(path->n);
+        if (cm.ops) {
+            memcpy(cm.ops, path->ops, path->n);
+            kv_push(CursorMatch, 0, *out, cm);
+        }
+    }
+
+    if (ref_consumed >= max_len) return;
+    if (ed_used >= k_mm && read_pos >= seq_len) return;
+
+    // Insertion in read (relative to reference): consume read only.
+    if (g_allow_indel_extension && ed_used < k_mm && read_pos < seq_len) {
+        if (align_path_push(path, 'I') == 0) {
+            cursor_collect_matches_dfs(sequence, seq_len, start, min_len, max_len, k_mm,
+                                       cur, read_pos + 1, ref_consumed, ed_used + 1, indel_used + 1, path, out);
+            align_path_pop(path);
+        }
+    }
+
+    // Match/substitution and deletion consume a reference base.
+    if (cur.edge_idx == CURSOR_AT_NODE) {
+        if (!cur.node) return;
+        for (uint8_t idx = 0; idx < ALPHABET_SIZE; ++idx) {
+            char ref_base = 0;
+            RefCursor next = {0};
+            if (cursor_take_ref_base(&cur, idx, 1, &ref_base, &next) != 0) continue;
+
+            if (read_pos < seq_len) {
+                int sub_cost = (toupper((unsigned char)sequence[read_pos]) == toupper((unsigned char)ref_base)) ? 0 : 1;
+                if (ed_used + sub_cost <= k_mm && align_path_push(path, 'M') == 0) {
+                    cursor_collect_matches_dfs(sequence, seq_len, start, min_len, max_len, k_mm,
+                                               next, read_pos + 1, ref_consumed + 1,
+                                               ed_used + sub_cost, indel_used, path, out);
+                    align_path_pop(path);
+                }
+            }
+
+            if (g_allow_indel_extension && ed_used < k_mm && align_path_push(path, 'D') == 0) {
+                cursor_collect_matches_dfs(sequence, seq_len, start, min_len, max_len, k_mm,
+                                           next, read_pos, ref_consumed + 1, ed_used + 1, indel_used + 1, path, out);
+                align_path_pop(path);
+            }
+        }
+        return;
+    }
+
+    char ref_base = 0;
+    RefCursor next = {0};
+    if (cursor_take_ref_base(&cur, cur.edge_idx, 0, &ref_base, &next) != 0) return;
+
+    if (read_pos < seq_len) {
+        int sub_cost = (toupper((unsigned char)sequence[read_pos]) == toupper((unsigned char)ref_base)) ? 0 : 1;
+        if (ed_used + sub_cost <= k_mm && align_path_push(path, 'M') == 0) {
+            cursor_collect_matches_dfs(sequence, seq_len, start, min_len, max_len, k_mm,
+                                       next, read_pos + 1, ref_consumed + 1,
+                                       ed_used + sub_cost, indel_used, path, out);
+            align_path_pop(path);
+        }
+    }
+
+    if (g_allow_indel_extension && ed_used < k_mm && align_path_push(path, 'D') == 0) {
+        cursor_collect_matches_dfs(sequence, seq_len, start, min_len, max_len, k_mm,
+                                   next, read_pos, ref_consumed + 1, ed_used + 1, indel_used + 1, path, out);
+        align_path_pop(path);
+    }
+}
+
+static int cmp_cursor_match_qsort(const void *pa, const void *pb) {
+    const CursorMatch *a = (const CursorMatch*)pa;
+    const CursorMatch *b = (const CursorMatch*)pb;
+    return cursor_match_cmp(a, b);
+}
+
+static size_t span_absdiff(size_t a, size_t b) {
+    return (a > b) ? (a - b) : (b - a);
+}
+
+static int sam_record_is_better(const SamAlignmentRecord *cand,
+                                const SamAlignmentRecord *best) {
+    if (!cand || !best) return 0;
+    if (cand->nm != best->nm) return cand->nm < best->nm;
+    if (cand->indel_count != best->indel_count) return cand->indel_count < best->indel_count;
+    size_t cdev = span_absdiff(cand->read_span, cand->ref_span);
+    size_t bdev = span_absdiff(best->read_span, best->ref_span);
+    if (cdev != bdev) return cdev < bdev;
+    return cand->match_start < best->match_start;
+}
+
 static void cursor_collect_matches_from_state(const KmerBitset *index,
                                               int state_id,
                                               const char *sequence,
@@ -451,47 +742,34 @@ static void cursor_collect_matches_from_state(const KmerBitset *index,
     if (mm_initial > k_mm) return;
 
     const TrieCursorState *st = &index->states[state_id];
-    const TrieNode *node = st->node;
-    uint8_t edge_idx = st->edge_idx;
-    uint16_t edge_off = st->edge_off;
-    size_t p = start + index->k;
-    size_t consumed = index->k;
-    int mm_used = mm_initial;
-
-    for (;;) {
-        if (edge_idx == CURSOR_AT_NODE) {
-            if (node->end && consumed >= min_len && consumed <= max_len) {
-                CursorMatch cm = { node->name, node->seq, node->seq_len, mm_used };
-                kv_push(CursorMatch, 0, *out, cm);
-            }
-
-            if (consumed >= max_len || p >= seq_len) break;
-            int idx = nt2bits(sequence[p]);
-            if (idx < 0) break;
-            if (!node->edge_label[idx] || !node->child[idx]) break;
-            edge_idx = (uint8_t)idx;
-            edge_off = 0;
+    RefCursor cur = { st->node, st->edge_idx, st->edge_off };
+    AlignPath path = {0};
+    int ok = 1;
+    for (size_t i = 0; i < index->k; ++i) {
+        if (align_path_push(&path, 'M') != 0) {
+            ok = 0;
+            break;
         }
+    }
+    if (ok) {
+        cursor_collect_matches_dfs(sequence,
+                                   seq_len,
+                                   start,
+                                   min_len,
+                                   max_len,
+                                   k_mm,
+                                   cur,
+                                   start + index->k,
+                                   index->k,
+                                   mm_initial,
+                                   0,
+                                   &path,
+                                   out);
+    }
+    free(path.ops);
 
-        const char *label = node->edge_label[edge_idx];
-        const TrieNode *child = node->child[edge_idx];
-        if (!label || !child) break;
-
-        size_t lablen = strlen(label);
-        size_t j = edge_off;
-        while (j < lablen && consumed < max_len && p < seq_len) {
-            if (sequence[p] != label[j]) {
-                if (++mm_used > k_mm) return;
-            }
-            ++p;
-            ++consumed;
-            ++j;
-        }
-
-        if (j < lablen) break; // ran out of room in this read slice
-        node = child;
-        edge_idx = CURSOR_AT_NODE;
-        edge_off = 0;
+    if (out->n > 1) {
+        qsort(out->a, out->n, sizeof(out->a[0]), cmp_cursor_match_qsort);
     }
 }
 
@@ -511,17 +789,21 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
     if (seed_mm < 0) seed_mm = 0;
     if (seed_mm > 1) seed_mm = 1;
 
-    khash_t(posset) *start_pos_cache = tls_get_start_pos_cache(); // dedupe absolute start positions
-    if (!start_pos_cache) return;
-    kh_clear(posset, start_pos_cache);
     CursorMatchVec matches; kv_init(matches);
+    kvec_t(SamAlignmentRecord) raw_records; kv_init(raw_records);
     kvec_t(SamAlignmentRecord) sam_records; kv_init(sam_records);
 
     for (size_t idx = 0; idx < hit->n; ++idx) {
         uint32_t h = hit->a[idx];
 
-        if ((size_t)h + (size_t)min_len > seq_len) continue;
-        if ((size_t)h + (size_t)max_len > seq_len) continue;
+        if ((size_t)h + seed_index->k > seq_len) continue;
+        size_t min_read_needed = 0;
+        if (g_allow_indel_extension) {
+            min_read_needed = (min_len > (uint32_t)k_mm) ? (size_t)(min_len - (uint32_t)k_mm) : 0;
+        } else {
+            min_read_needed = (size_t)min_len;
+        }
+        if ((size_t)h + min_read_needed > seq_len) continue;
 
         uint64_t code = 0;
         if (encode_kmer(sequence + h, seed_index->k, &code) < 0) continue;
@@ -531,32 +813,26 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
 
         // exact seed first
         if (exact_sid >= 0) {
-            matches.n = 0;
+            clear_cursor_matches_keep_capacity(&matches);
             cursor_collect_matches_from_state(seed_index, exact_sid, sequence, seq_len, h,
                                               min_len, max_len, 0, k_mm, &matches);
-            for (size_t m = 0; m < matches.n; ++m) {
-                khiter_t it = kh_get(posset, start_pos_cache, (khint_t)h);
-                if (it != kh_end(start_pos_cache)) { matched_this_start = 1; break; }
-
-                int ret = 0;
-                it = kh_put(posset, start_pos_cache, (khint_t)h, &ret);
-                (void)ret;
-
-                khiter_t jt = kh_put(strset, found_sequences, (char*)matches.a[m].name, &ret);
-                if (ret > 0) kh_key(found_sequences, jt) = strdup(matches.a[m].name);
-
-                if (sam_fp) {
-                    SamAlignmentRecord rec = {
-                        kh_key(found_sequences, jt),
-                        matches.a[m].seq,
-                        h,
-                        matches.a[m].seq_len,
-                        matches.a[m].mm
-                    };
-                    kv_push(SamAlignmentRecord, 0, sam_records, rec);
-                }
+            if (matches.n > 0) {
+                const CursorMatch *best = &matches.a[0];
+                char *ops_copy = (char*)malloc(best->nops);
+                if (ops_copy) memcpy(ops_copy, best->ops, best->nops);
+                SamAlignmentRecord rec = {
+                    best->name,
+                    best->seq,
+                    h,
+                    best->read_span,
+                    best->seq_len,
+                    best->ed,
+                    best->indel_count,
+                    ops_copy,
+                    best->nops
+                };
+                kv_push(SamAlignmentRecord, 0, raw_records, rec);
                 matched_this_start = 1;
-                break; // preserve existing one-hit-per-start behavior
             }
         }
 
@@ -573,35 +849,70 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
                 int sid = seed_index->state_idx[neighbor];
                 if (sid < 0) continue;
 
-                matches.n = 0;
+                clear_cursor_matches_keep_capacity(&matches);
                 cursor_collect_matches_from_state(seed_index, sid, sequence, seq_len, h,
                                                   min_len, max_len, 1, k_mm, &matches);
-                for (size_t m = 0; m < matches.n; ++m) {
-                    khiter_t it = kh_get(posset, start_pos_cache, (khint_t)h);
-                    if (it != kh_end(start_pos_cache)) { matched_this_start = 1; break; }
-
-                    int ret = 0;
-                    it = kh_put(posset, start_pos_cache, (khint_t)h, &ret);
-                    (void)ret;
-
-                    khiter_t jt = kh_put(strset, found_sequences, (char*)matches.a[m].name, &ret);
-                    if (ret > 0) kh_key(found_sequences, jt) = strdup(matches.a[m].name);
-
-                    if (sam_fp) {
-                        SamAlignmentRecord rec = {
-                            kh_key(found_sequences, jt),
-                            matches.a[m].seq,
-                            h,
-                            matches.a[m].seq_len,
-                            matches.a[m].mm
-                        };
-                        kv_push(SamAlignmentRecord, 0, sam_records, rec);
-                    }
+                if (matches.n > 0) {
+                    const CursorMatch *best = &matches.a[0];
+                    char *ops_copy = (char*)malloc(best->nops);
+                    if (ops_copy) memcpy(ops_copy, best->ops, best->nops);
+                    SamAlignmentRecord rec = {
+                        best->name,
+                        best->seq,
+                        h,
+                        best->read_span,
+                        best->seq_len,
+                        best->ed,
+                        best->indel_count,
+                        ops_copy,
+                        best->nops
+                    };
+                    kv_push(SamAlignmentRecord, 0, raw_records, rec);
                     matched_this_start = 1;
-                    break; // preserve existing one-hit-per-start behavior
                 }
             }
         }
+    }
+
+    // Collapse nearby hits per reference without adding CLI options:
+    // nearby window = allowed edit distance - 1.
+    size_t nearby_window = (k_mm > 0) ? (size_t)(k_mm - 1) : 0;
+    for (size_t i = 0; i < raw_records.n; ++i) {
+        SamAlignmentRecord rec = raw_records.a[i];
+        raw_records.a[i].ops = NULL;
+        raw_records.a[i].nops = 0;
+
+        size_t slot = (size_t)-1;
+        if (nearby_window > 0) {
+            for (size_t j = 0; j < sam_records.n; ++j) {
+                SamAlignmentRecord *cur = &sam_records.a[j];
+                if (strcmp(cur->ref_name, rec.ref_name) != 0) continue;
+                size_t d = span_absdiff(cur->match_start, rec.match_start);
+                if (d <= nearby_window) {
+                    slot = j;
+                    break;
+                }
+            }
+        }
+
+        if (slot == (size_t)-1) {
+            kv_push(SamAlignmentRecord, 0, sam_records, rec);
+            continue;
+        }
+
+        if (sam_record_is_better(&rec, &sam_records.a[slot])) {
+            free(sam_records.a[slot].ops);
+            sam_records.a[slot] = rec;
+        } else {
+            free(rec.ops);
+        }
+    }
+
+    // Update read-level hit set after nearby-collapse.
+    for (size_t i = 0; i < sam_records.n; ++i) {
+        int ret = 0;
+        khiter_t jt = kh_put(strset, found_sequences, (char*)sam_records.a[i].ref_name, &ret);
+        if (ret > 0) kh_key(found_sequences, jt) = strdup(sam_records.a[i].ref_name);
     }
 
     if (sam_fp && sam_records.n > 0) {
@@ -619,6 +930,7 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
         sam_buf->len = 0;
         int write_status = 0;
         for (size_t i = 0; i < sam_records.n; ++i) {
+            if (!sam_records.a[i].ops || sam_records.a[i].nops == 0) continue;
             size_t sam_match_start = sam_records.a[i].match_start + sam_match_offset;
             if (sam_write_alignment(sam_buf,
                                     read_name,
@@ -627,9 +939,12 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
                                     sam_seq_len,
                                     sam_records.a[i].ref_name,
                                     sam_records.a[i].ref_seq,
+                                    sam_records.a[i].ref_span,
                                     sam_match_start,
-                                    sam_records.a[i].match_len,
+                                    sam_records.a[i].read_span,
                                     sam_records.a[i].nm,
+                                    sam_records.a[i].ops,
+                                    sam_records.a[i].nops,
                                     nh,
                                     sam_soft_clip,
                                     has_full_qual) != 0) {
@@ -643,7 +958,11 @@ void find_matches_seeded(const char *sequence, size_t seq_len,
         (void)write_status;
     }
 
+    clear_cursor_matches_keep_capacity(&matches);
     kv_destroy(matches);
+    free_sam_records(&raw_records);
+    kv_destroy(raw_records);
+    free_sam_records(&sam_records);
     kv_destroy(sam_records);
 }
 
@@ -728,14 +1047,23 @@ void find_matches(const char *sequence, size_t seq_len,
             }
 
             if (sam_fp) {
-                SamAlignmentRecord rec = {
-                    kh_key(found_sequences, jt),
-                    matches.a[m].seq,
-                    abs_start,
-                    strlen(matches.a[m].seq),
-                    matches.a[m].mm
-                };
-                kv_push(SamAlignmentRecord, 0, sam_records, rec);
+                size_t ref_span = strlen(matches.a[m].seq);
+                char *ops = (char*)malloc(ref_span);
+                if (ops) {
+                    memset(ops, 'M', ref_span);
+                    SamAlignmentRecord rec = {
+                        kh_key(found_sequences, jt),
+                        matches.a[m].seq,
+                        abs_start,
+                        ref_span,
+                        ref_span,
+                        matches.a[m].mm,
+                        0,
+                        ops,
+                        ref_span
+                    };
+                    kv_push(SamAlignmentRecord, 0, sam_records, rec);
+                }
             }
         }
 
@@ -765,9 +1093,12 @@ void find_matches(const char *sequence, size_t seq_len,
                                     sam_seq_len,
                                     sam_records.a[i].ref_name,
                                     sam_records.a[i].ref_seq,
+                                    sam_records.a[i].ref_span,
                                     sam_match_start,
-                                    sam_records.a[i].match_len,
+                                    sam_records.a[i].read_span,
                                     sam_records.a[i].nm,
+                                    sam_records.a[i].ops,
+                                    sam_records.a[i].nops,
                                     nh,
                                     sam_soft_clip,
                                     has_full_qual) != 0) {
@@ -781,6 +1112,7 @@ void find_matches(const char *sequence, size_t seq_len,
         (void)write_status;
     }
 
+    free_sam_records(&sam_records);
     kv_destroy(sam_records);
     mv_free(&matches);
 }

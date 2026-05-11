@@ -70,7 +70,8 @@ fastp \
 | `--no-sam-unmapped` | Do not write unmapped reads (FLAG `4`) into SAM output. | off (unmapped reads included) |
 | `-k`, `--kmer INT` | Seed k-mer length for prefilter. Allowed: `4..12`. | `8` |
 | `--seed-mm INT` | Seed mismatches allowed. Allowed: `0` or `1`. | `0` |
-| `-m`, `--mismatch INT` | Total mismatches allowed during extension. Clamped to `0..5`; if omitted, defaults to `--seed-mm`. | `0` or `1` (inherits `--seed-mm`) |
+| `--indel` | Enable indels during trie extension. If omitted, extension allows substitutions only. | off |
+| `-m`, `--mismatch INT` | Total edit distance allowed during trie extension. With `--indel`, this is mismatch+indel; without `--indel`, substitutions-only. Clamped to `0..5`; if omitted, defaults to `--seed-mm`. | `0` or `1` (inherits `--seed-mm`) |
 | `--exclude-multihit` | Exclude reads with more than one reference hit from final counting (SAM output unaffected). | off |
 | `-a`, `--anchors STR` | Enable anchor-gated mapping. Format: `5p_adapter...3p_adapter`, `5p_adapter...`, or `...3p_adapter` (A/C/G/T only). | off |
 | `--anchor-error INT` | Allowed anchor edit distance (mismatch + indel together). Range: `0..5`. | `0` |
@@ -187,8 +188,11 @@ At least one of `-o/--output` or `-c/--count` must be provided.
 # Skip unmapped records in SAM output
 ./cubaTrie count -r reference.fasta -i reads.fastq.gz -o counts.csv -s output.sam --no-sam-unmapped
 
-# More sensitive seeding (allow 1 mismatch in seed and query)
+# More sensitive seeding (allow 1 mismatch in seed and total edit distance 1 in extension)
 ./cubaTrie count -r reference.fasta -i reads.fastq.gz -k 8 --seed-mm 1 -m 1 -o counts.csv
+
+# Enable indels in extension (optional; default is substitutions-only)
+./cubaTrie count -r reference.fasta -i reads.fastq.gz -k 8 --seed-mm 1 --indel -m 1 -o counts.csv
 
 # Exclude multi-hit reads from count table
 ./cubaTrie count -r reference.fasta -i reads.fastq.gz --exclude-multihit -o counts.csv

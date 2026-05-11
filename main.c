@@ -5,6 +5,7 @@
 #include "utils.h"
 #include "ketopt.h"
 #include "readseq.h"
+#include "kmer.h"
 
 typedef enum {
     COMMAND_COUNT = 0,
@@ -23,6 +24,7 @@ typedef struct {
     int rc;
     int verbose;
     int mm;
+    int indel;
     int exclude_multihit;
     int anchor_enabled;
     char *anchor5;
@@ -140,11 +142,12 @@ static void usage_count(const char *prog) {
         "      --no-sam-unmapped   do not emit unmapped records (FLAG 4) into SAM\n"
         "  -k, --kmer INT          seed k-mer length for prefilter [4..12] (default: 8)\n"
         "      --seed-mm INT       allowed seed mismatches [0|1] (default: 0)\n"
+        "      --indel             enable indels during extension (default: substitutions-only)\n"
         "      --exclude-multihit  do not count reads with >1 reference hit\n"
         "      --no-rc             Disable Reverse Complement (default off)\n"
         "  -a, --anchors STR       Anchors: 5p_adapter...3p_adapter, 5p_adapter..., or ...3p_adapter\n"
         "      --anchor-error INT  Allowed adapter edit distance [0..5] (mismatch+indel)\n"
-        "  -m, --mismatch INT      Number of mismatches allowed [0..5] (default: --seed-mm)\n"
+        "  -m, --mismatch INT      Max extension distance [0..5]; substitutions-only unless --indel is set\n"
         "  -d, --dup-policy MODE   duplicate handling: error|warn|ignore [error]\n"
         "  -t, --threads UINT      Number of worker threads [1]\n"
         "  -v                      Print Debugging Log Messages\n"
@@ -200,6 +203,7 @@ static int parse_count_args(int argc, char **argv, const char *prog, CountOption
         {"soft-clip", ko_no_argument,       304},
         {"no-sam-unmapped", ko_no_argument, 305},
         {"seed-mm",   ko_required_argument, 302},
+        {"indel",     ko_no_argument,       308},
         {"exclude-multihit", ko_no_argument, 303},
         {"anchors",   ko_required_argument, 'a'},
         {"anchor-error", ko_required_argument, 306},
@@ -224,6 +228,7 @@ static int parse_count_args(int argc, char **argv, const char *prog, CountOption
     opt->verbose = 0;
     opt->threads = 1;
     opt->mm = 0;
+    opt->indel = 0;
     opt->exclude_multihit = 0;
     opt->anchor_enabled = 0;
     opt->anchor5 = NULL;
@@ -269,6 +274,9 @@ static int parse_count_args(int argc, char **argv, const char *prog, CountOption
             break;
         case 303:
             opt->exclude_multihit = 1;
+            break;
+        case 308:
+            opt->indel = 1;
             break;
         case 306:
             opt->anchor_error = atoi(o.arg);
@@ -323,7 +331,7 @@ static int parse_count_args(int argc, char **argv, const char *prog, CountOption
     }
     if (opt->seed_mm > opt->mm) {
         fprintf(stderr,
-                "Invalid mismatch settings: --seed-mm=%d requires -m/--mismatch >= %d.\n",
+                "Invalid edit-distance settings: --seed-mm=%d requires -m/--mismatch >= %d.\n",
                 opt->seed_mm, opt->seed_mm);
         return -7;
     }
@@ -568,6 +576,8 @@ int main(int argc, char **argv) {
         free_anchor_pair(&opt.anchor5, &opt.anchor3);
         return (pr == -1) ? 0 : 1;
     }
+
+    kmer_set_indel_mode(opt.indel);
 
     kh_counter_t *map = kh_init(counter);
     TrieNode *root = trie_create_node();
