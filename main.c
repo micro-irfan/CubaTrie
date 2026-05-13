@@ -165,8 +165,9 @@ static void usage_cut(const char *prog) {
         "  -c, --count FILE        output CSV of kept insert counts (header: sequence,count)\n"
         "  -a, --anchors STR       Anchors: 5p_adapter...3p_adapter, 5p_adapter..., or ...3p_adapter\n"
         "      --anchor-error INT  Allowed adapter edit distance [0..5] (mismatch+indel)\n"
-        "  -m, --min INT           minimum trimmed insert length (required)\n"
-        "  -M, --max INT           maximum trimmed insert length (required)\n"
+        "  -m, --min INT           minimum trimmed insert length\n"
+        "  -M, --max INT           maximum trimmed insert length\n"
+        "                          defaults: --min 1 and unbounded --max when omitted\n"
         "  -t, --threads UINT      number of worker threads [1]\n"
         "      --check-rc          retry anchor search on reverse-complement read\n"
         "  -v                      Print Debugging Log Messages\n"
@@ -481,14 +482,12 @@ static int parse_cut_args(int argc, char **argv, const char *prog, CutOptions *o
         return -16;
     }
     if (!opt->min_set) {
-        fprintf(stderr, "Missing required option: -m/--min\n");
-        usage_cut(prog);
-        return -17;
+        opt->min_len = 1;
+        opt->min_set = 1;
     }
     if (!opt->max_set) {
-        fprintf(stderr, "Missing required option: -M/--max\n");
-        usage_cut(prog);
-        return -18;
+        opt->max_len = (size_t)-1;
+        opt->max_set = 1;
     }
     if (opt->min_len > opt->max_len) {
         fprintf(stderr, "Invalid length range: --min (%zu) must be <= --max (%zu)\n",

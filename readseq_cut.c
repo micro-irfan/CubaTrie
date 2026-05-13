@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <pthread.h>
 #include <zlib.h>
 
@@ -14,6 +15,8 @@ typedef struct {
     int use_gzip;
     FILE *fp;
     gzFile gzf;
+    char *scratch;
+    size_t scratch_cap;
 } FastqOut;
 
 typedef struct {
@@ -24,6 +27,7 @@ typedef struct {
 } CutStats;
 
 typedef struct {
+    char *storage;
     char *name;
     char *seq;
     char *qual;
@@ -45,15 +49,42 @@ typedef struct {
 } CutTaskQueue;
 
 typedef struct {
+    char *data;
+    size_t len;
+} CutWriteChunk;
+
+typedef struct {
+    CutWriteChunk *buf;
+    size_t cap;
+    size_t head;
+    size_t tail;
+    size_t size;
+    int done;
+    int aborted;
+    pthread_mutex_t mtx;
+    pthread_cond_t not_empty;
+    pthread_cond_t not_full;
+} CutWriteQueue;
+
+typedef struct {
     CutTaskQueue *queue;
+    CutWriteQueue *write_queue;
     const AnchorRuntime *anchor_runtime;
     int check_revcomp;
-    FastqOut *out;
-    pthread_mutex_t *out_mtx;
+    char *write_batch;
+    size_t write_batch_len;
+    size_t write_batch_cap;
+    size_t write_batch_target;
     CutStats stats;
     int status;
     kh_counter_t *counts;
 } CutWorkerCtx;
+
+typedef struct {
+    CutWriteQueue *queue;
+    FastqOut *out;
+    int status;
+} CutWriterCtx;
 
 typedef struct {
     const char *sequence;
@@ -61,6 +92,10 @@ typedef struct {
 } CutCountEntry;
 
 static const size_t CUT_TASK_QUEUE_CAPACITY = 4096;
+static const size_t CUT_WRITE_QUEUE_CAPACITY = 256;
+static const size_t CUT_WRITE_BATCH_TARGET = 1u << 20;
+static const int CUT_GZIP_LEVEL = 1;
+static const size_t CUT_GZIP_BUFFER_SIZE = 1u << 20;
 
 static int has_gz_suffix(const char *path) {
     if (!path) return 0;
@@ -79,6 +114,8 @@ static int fastq_out_open(FastqOut *out, const char *path) {
     if (has_gz_suffix(path)) {
         out->gzf = gzopen(path, "wb");
         if (!out->gzf) return -1;
+        (void)gzbuffer(out->gzf, (unsigned)CUT_GZIP_BUFFER_SIZE);
+        (void)gzsetparams(out->gzf, CUT_GZIP_LEVEL, Z_DEFAULT_STRATEGY);
         out->use_gzip = 1;
         return 0;
     }
@@ -88,26 +125,52 @@ static int fastq_out_open(FastqOut *out, const char *path) {
     return 0;
 }
 
+static int fastq_out_write_bytes(FastqOut *out, const char *buf, size_t len) {
+    if (!out || !buf) return -1;
+    if (len == 0) return 0;
+    if (out->use_gzip) {
+        size_t off = 0;
+        while (off < len) {
+            unsigned chunk = (len - off > (size_t)UINT_MAX) ? UINT_MAX : (unsigned)(len - off);
+            int wrote = gzwrite(out->gzf, buf + off, chunk);
+            if (wrote <= 0 || (unsigned)wrote != chunk) return -1;
+            off += (size_t)wrote;
+        }
+        return 0;
+    }
+    return fwrite(buf, 1, len, out->fp) == len ? 0 : -1;
+}
+
 static int fastq_out_write(FastqOut *out,
                            const char *name,
                            const char *seq,
                            const char *qual,
                            size_t len) {
     if (!out || !name || !seq || !qual) return -1;
-    if (out->use_gzip) {
-        if (gzprintf(out->gzf, "@%s\n", name) <= 0) return -1;
-        if ((size_t)gzwrite(out->gzf, seq, (unsigned)len) != len) return -1;
-        if (gzprintf(out->gzf, "\n+\n") <= 0) return -1;
-        if ((size_t)gzwrite(out->gzf, qual, (unsigned)len) != len) return -1;
-        if (gzprintf(out->gzf, "\n") <= 0) return -1;
-        return 0;
+    size_t name_len = strlen(name);
+    size_t rec_len = name_len + (2 * len) + 6; /* @name\nseq\n+\nqual\n */
+
+    if (out->scratch_cap < rec_len) {
+        size_t new_cap = out->scratch_cap ? out->scratch_cap : 1024;
+        while (new_cap < rec_len) new_cap <<= 1;
+        char *nb = (char*)realloc(out->scratch, new_cap);
+        if (!nb) return -1;
+        out->scratch = nb;
+        out->scratch_cap = new_cap;
     }
-    if (fprintf(out->fp, "@%s\n", name) < 0) return -1;
-    if (fwrite(seq, 1, len, out->fp) != len) return -1;
-    if (fputs("\n+\n", out->fp) == EOF) return -1;
-    if (fwrite(qual, 1, len, out->fp) != len) return -1;
-    if (fputc('\n', out->fp) == EOF) return -1;
-    return 0;
+
+    char *p = out->scratch;
+    *p++ = '@';
+    memcpy(p, name, name_len); p += name_len;
+    *p++ = '\n';
+    memcpy(p, seq, len); p += len;
+    *p++ = '\n';
+    *p++ = '+';
+    *p++ = '\n';
+    memcpy(p, qual, len); p += len;
+    *p++ = '\n';
+
+    return fastq_out_write_bytes(out, out->scratch, rec_len);
 }
 
 static void fastq_out_close(FastqOut *out) {
@@ -117,6 +180,9 @@ static void fastq_out_close(FastqOut *out) {
     } else if (out->fp && out->fp != stdout) {
         fclose(out->fp);
     }
+    free(out->scratch);
+    out->scratch = NULL;
+    out->scratch_cap = 0;
 }
 
 static char rc_base(char c) {
@@ -252,9 +318,8 @@ static int cut_write_count_csv_sorted(const kh_counter_t *counts, const char *pa
 
 static void cut_task_free(CutTask *task) {
     if (!task) return;
-    free(task->name);
-    free(task->seq);
-    free(task->qual);
+    free(task->storage);
+    task->storage = NULL;
     task->name = NULL;
     task->seq = NULL;
     task->qual = NULL;
@@ -366,6 +431,172 @@ static void cut_queue_destroy(CutTaskQueue *q) {
     pthread_mutex_destroy(&q->mtx);
 }
 
+static int cut_write_queue_init(CutWriteQueue *q, size_t cap) {
+    if (!q || cap == 0) return -1;
+    memset(q, 0, sizeof(*q));
+    q->buf = (CutWriteChunk*)calloc(cap, sizeof(*q->buf));
+    if (!q->buf) return -1;
+    q->cap = cap;
+    if (pthread_mutex_init(&q->mtx, NULL) != 0) {
+        free(q->buf);
+        q->buf = NULL;
+        return -1;
+    }
+    if (pthread_cond_init(&q->not_empty, NULL) != 0) {
+        pthread_mutex_destroy(&q->mtx);
+        free(q->buf);
+        q->buf = NULL;
+        return -1;
+    }
+    if (pthread_cond_init(&q->not_full, NULL) != 0) {
+        pthread_cond_destroy(&q->not_empty);
+        pthread_mutex_destroy(&q->mtx);
+        free(q->buf);
+        q->buf = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+static void cut_write_queue_request_abort(CutWriteQueue *q) {
+    if (!q) return;
+    pthread_mutex_lock(&q->mtx);
+    q->aborted = 1;
+    pthread_cond_broadcast(&q->not_empty);
+    pthread_cond_broadcast(&q->not_full);
+    pthread_mutex_unlock(&q->mtx);
+}
+
+static void cut_write_queue_finish(CutWriteQueue *q) {
+    if (!q) return;
+    pthread_mutex_lock(&q->mtx);
+    q->done = 1;
+    pthread_cond_broadcast(&q->not_empty);
+    pthread_mutex_unlock(&q->mtx);
+}
+
+static int cut_write_queue_push(CutWriteQueue *q, CutWriteChunk *chunk) {
+    if (!q || !chunk || !chunk->data || chunk->len == 0) return -1;
+    pthread_mutex_lock(&q->mtx);
+    while (q->size == q->cap && !q->aborted) {
+        pthread_cond_wait(&q->not_full, &q->mtx);
+    }
+    if (q->aborted) {
+        pthread_mutex_unlock(&q->mtx);
+        return -1;
+    }
+
+    q->buf[q->tail] = *chunk;
+    memset(chunk, 0, sizeof(*chunk));
+    q->tail = (q->tail + 1) % q->cap;
+    q->size++;
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->mtx);
+    return 0;
+}
+
+static int cut_write_queue_pop(CutWriteQueue *q, CutWriteChunk *chunk_out) {
+    if (!q || !chunk_out) return -1;
+    pthread_mutex_lock(&q->mtx);
+    while (q->size == 0 && !q->done && !q->aborted) {
+        pthread_cond_wait(&q->not_empty, &q->mtx);
+    }
+    if (q->aborted) {
+        pthread_mutex_unlock(&q->mtx);
+        return -1;
+    }
+    if (q->size == 0 && q->done) {
+        pthread_mutex_unlock(&q->mtx);
+        return 1;
+    }
+
+    *chunk_out = q->buf[q->head];
+    memset(&q->buf[q->head], 0, sizeof(q->buf[q->head]));
+    q->head = (q->head + 1) % q->cap;
+    q->size--;
+    pthread_cond_signal(&q->not_full);
+    pthread_mutex_unlock(&q->mtx);
+    return 0;
+}
+
+static void cut_write_queue_destroy(CutWriteQueue *q) {
+    if (!q) return;
+    if (q->buf) {
+        for (size_t i = 0; i < q->size; ++i) {
+            size_t idx = (q->head + i) % q->cap;
+            free(q->buf[idx].data);
+            q->buf[idx].data = NULL;
+            q->buf[idx].len = 0;
+        }
+    }
+    free(q->buf);
+    q->buf = NULL;
+    pthread_cond_destroy(&q->not_empty);
+    pthread_cond_destroy(&q->not_full);
+    pthread_mutex_destroy(&q->mtx);
+}
+
+static int cut_worker_flush_batch(CutWorkerCtx *ctx) {
+    if (!ctx || !ctx->write_queue || !ctx->write_batch || ctx->write_batch_len == 0) return 0;
+    CutWriteChunk chunk = {0};
+    chunk.data = ctx->write_batch;
+    chunk.len = ctx->write_batch_len;
+    if (cut_write_queue_push(ctx->write_queue, &chunk) != 0) {
+        free(ctx->write_batch);
+        ctx->write_batch = NULL;
+        ctx->write_batch_len = 0;
+        ctx->write_batch_cap = 0;
+        return -1;
+    }
+    ctx->write_batch = NULL;
+    ctx->write_batch_len = 0;
+    ctx->write_batch_cap = 0;
+    return 0;
+}
+
+static int cut_worker_reserve_batch(CutWorkerCtx *ctx, size_t add) {
+    if (!ctx || !ctx->write_queue) return -1;
+    size_t need = ctx->write_batch_len + add;
+    if (ctx->write_batch_cap >= need) return 0;
+
+    size_t new_cap = ctx->write_batch_cap ? ctx->write_batch_cap : 1024;
+    while (new_cap < need) new_cap <<= 1;
+    char *nb = (char*)realloc(ctx->write_batch, new_cap);
+    if (!nb) return -1;
+    ctx->write_batch = nb;
+    ctx->write_batch_cap = new_cap;
+    return 0;
+}
+
+static int cut_worker_append_fastq(CutWorkerCtx *ctx,
+                                   const char *name,
+                                   const char *seq,
+                                   const char *qual,
+                                   size_t len) {
+    if (!ctx || !ctx->write_queue || !name || !seq || !qual) return -1;
+    size_t name_len = strlen(name);
+    size_t rec_len = name_len + (2 * len) + 6; /* @name\nseq\n+\nqual\n */
+
+    if (cut_worker_reserve_batch(ctx, rec_len) != 0) return -1;
+
+    char *p = ctx->write_batch + ctx->write_batch_len;
+    *p++ = '@';
+    memcpy(p, name, name_len); p += name_len;
+    *p++ = '\n';
+    memcpy(p, seq, len); p += len;
+    *p++ = '\n';
+    *p++ = '+';
+    *p++ = '\n';
+    memcpy(p, qual, len); p += len;
+    *p++ = '\n';
+    ctx->write_batch_len += rec_len;
+
+    if (ctx->write_batch_len >= ctx->write_batch_target) {
+        return cut_worker_flush_batch(ctx);
+    }
+    return 0;
+}
+
 static int cut_process_record(const AnchorRuntime *ar,
                               int check_revcomp,
                               const char *name,
@@ -374,7 +605,7 @@ static int cut_process_record(const AnchorRuntime *ar,
                               size_t len,
                               size_t qual_len,
                               FastqOut *out,
-                              pthread_mutex_t *out_mtx,
+                              CutWorkerCtx *worker_ctx,
                               CutStats *stats,
                               kh_counter_t *counts) {
     if (!ar || !name || !seq || !stats) return -1;
@@ -416,10 +647,14 @@ static int cut_process_record(const AnchorRuntime *ar,
     }
 
     if (out) {
-        int wr = 0;
-        if (out_mtx) pthread_mutex_lock(out_mtx);
-        wr = fastq_out_write(out, name, src_seq + start, src_qual + start, trim_len);
-        if (out_mtx) pthread_mutex_unlock(out_mtx);
+        int wr = fastq_out_write(out, name, src_seq + start, src_qual + start, trim_len);
+        if (wr != 0) {
+            free(rc_seq);
+            free(rc_qual);
+            return -1;
+        }
+    } else if (worker_ctx && worker_ctx->write_queue) {
+        int wr = cut_worker_append_fastq(worker_ctx, name, src_seq + start, src_qual + start, trim_len);
         if (wr != 0) {
             free(rc_seq);
             free(rc_qual);
@@ -455,12 +690,13 @@ static void *cut_worker_main(void *arg) {
                                task.qual,
                                task.len,
                                task.qual_len,
-                               ctx->out,
-                               ctx->out_mtx,
+                               NULL,
+                               ctx,
                                &ctx->stats,
                                ctx->counts) != 0) {
             ctx->status = 1;
             cut_queue_request_abort(ctx->queue);
+            cut_write_queue_request_abort(ctx->write_queue);
             cut_task_free(&task);
             break;
         }
@@ -468,6 +704,41 @@ static void *cut_worker_main(void *arg) {
         cut_task_free(&task);
     }
 
+    if (ctx->status == 0 && ctx->write_queue) {
+        if (cut_worker_flush_batch(ctx) != 0) {
+            ctx->status = 1;
+            cut_queue_request_abort(ctx->queue);
+            cut_write_queue_request_abort(ctx->write_queue);
+        }
+    }
+    free(ctx->write_batch);
+    ctx->write_batch = NULL;
+    ctx->write_batch_len = 0;
+    ctx->write_batch_cap = 0;
+    return NULL;
+}
+
+static void *cut_writer_main(void *arg) {
+    CutWriterCtx *ctx = (CutWriterCtx*)arg;
+    if (!ctx || !ctx->queue || !ctx->out) return NULL;
+
+    for (;;) {
+        CutWriteChunk chunk = {0};
+        int pop_rc = cut_write_queue_pop(ctx->queue, &chunk);
+        if (pop_rc == 1) break;
+        if (pop_rc < 0) {
+            ctx->status = 1;
+            break;
+        }
+
+        if (fastq_out_write_bytes(ctx->out, chunk.data, chunk.len) != 0) {
+            free(chunk.data);
+            ctx->status = 1;
+            cut_write_queue_request_abort(ctx->queue);
+            break;
+        }
+        free(chunk.data);
+    }
     return NULL;
 }
 
@@ -555,9 +826,13 @@ static int cut_fastq_by_anchors_mt(const char *in_path,
                                     const char *count_out_path) {
     int status = 0;
     int queue_inited = 0;
-    int out_mtx_inited = 0;
+    int write_queue_inited = 0;
+    int writer_started = 0;
+    int workers_joined = 0;
     pthread_t *tids = NULL;
     CutWorkerCtx *ctxs = NULL;
+    pthread_t writer_tid = 0;
+    CutWriterCtx writer_ctx = {0};
     kh_counter_t *all_counts = NULL;
 
     gzFile in_fp = gzopen(in_path, "rb");
@@ -603,13 +878,21 @@ static int cut_fastq_by_anchors_mt(const char *in_path,
     }
     queue_inited = 1;
 
-    pthread_mutex_t out_mtx;
+    CutWriteQueue write_queue;
     if (out_opened) {
-        if (pthread_mutex_init(&out_mtx, NULL) != 0) {
+        if (cut_write_queue_init(&write_queue, CUT_WRITE_QUEUE_CAPACITY) != 0) {
             status = 1;
             goto cleanup;
         }
-        out_mtx_inited = 1;
+        write_queue_inited = 1;
+        writer_ctx.queue = &write_queue;
+        writer_ctx.out = &out;
+        writer_ctx.status = 0;
+        if (pthread_create(&writer_tid, NULL, cut_writer_main, &writer_ctx) != 0) {
+            status = 1;
+            goto cleanup;
+        }
+        writer_started = 1;
     }
 
     tids = (pthread_t*)calloc(threads, sizeof(*tids));
@@ -622,10 +905,13 @@ static int cut_fastq_by_anchors_mt(const char *in_path,
     size_t started = 0;
     for (size_t i = 0; i < threads; ++i) {
         ctxs[i].queue = &queue;
+        ctxs[i].write_queue = out_opened ? &write_queue : NULL;
         ctxs[i].anchor_runtime = ar;
         ctxs[i].check_revcomp = check_revcomp;
-        ctxs[i].out = out_opened ? &out : NULL;
-        ctxs[i].out_mtx = out_opened ? &out_mtx : NULL;
+        ctxs[i].write_batch = NULL;
+        ctxs[i].write_batch_len = 0;
+        ctxs[i].write_batch_cap = 0;
+        ctxs[i].write_batch_target = CUT_WRITE_BATCH_TARGET;
         memset(&ctxs[i].stats, 0, sizeof(ctxs[i].stats));
         ctxs[i].status = 0;
         ctxs[i].counts = NULL;
@@ -649,17 +935,36 @@ static int cut_fastq_by_anchors_mt(const char *in_path,
     if (status == 0) {
         while ((l = kseq_read(ks)) >= 0) {
             CutTask task = {0};
-            task.name = dup_cstr_n(ks->name.s, ks->name.l);
-            task.seq = dup_cstr_n(ks->seq.s, ks->seq.l);
-            task.len = ks->seq.l;
-            task.qual_len = ks->qual.l;
-            task.qual = ks->qual.l ? dup_cstr_n(ks->qual.s, ks->qual.l) : NULL;
+            size_t name_len = ks->name.l;
+            size_t seq_len = ks->seq.l;
+            size_t qual_len = ks->qual.l;
+            size_t block_len = (name_len + 1) + (seq_len + 1) + (qual_len ? (qual_len + 1) : 0);
 
-            if (!task.name || !task.seq || (ks->qual.l && !task.qual)) {
-                cut_task_free(&task);
+            task.storage = (char*)malloc(block_len);
+            if (!task.storage) {
                 status = 1;
                 cut_queue_request_abort(&queue);
                 break;
+            }
+            char *p = task.storage;
+            task.name = p;
+            memcpy(task.name, ks->name.s, name_len);
+            task.name[name_len] = '\0';
+            p += name_len + 1;
+
+            task.seq = p;
+            memcpy(task.seq, ks->seq.s, seq_len);
+            task.seq[seq_len] = '\0';
+            p += seq_len + 1;
+
+            task.len = ks->seq.l;
+            task.qual_len = ks->qual.l;
+            if (qual_len) {
+                task.qual = p;
+                memcpy(task.qual, ks->qual.s, qual_len);
+                task.qual[qual_len] = '\0';
+            } else {
+                task.qual = NULL;
             }
 
             if (cut_queue_push(&queue, &task) != 0) {
@@ -675,6 +980,15 @@ static int cut_fastq_by_anchors_mt(const char *in_path,
     cut_queue_finish(&queue);
     for (size_t i = 0; i < started; ++i) {
         pthread_join(tids[i], NULL);
+    }
+    workers_joined = 1;
+    if (out_opened) {
+        cut_write_queue_finish(&write_queue);
+        if (writer_started) {
+            pthread_join(writer_tid, NULL);
+            writer_started = 0;
+            if (writer_ctx.status != 0) status = 1;
+        }
     }
 
     CutStats stats = {0};
@@ -699,15 +1013,30 @@ static int cut_fastq_by_anchors_mt(const char *in_path,
             stats.total, stats.kept, stats.discarded, stats.kept_rc);
 
 cleanup:
+    if (queue_inited) cut_queue_finish(&queue);
+    if (!workers_joined && ctxs && tids && started > 0) {
+        for (size_t i = 0; i < started; ++i) {
+            pthread_join(tids[i], NULL);
+        }
+    }
+    if (out_opened && write_queue_inited) {
+        cut_write_queue_finish(&write_queue);
+        if (writer_started) {
+            pthread_join(writer_tid, NULL);
+            writer_started = 0;
+            if (writer_ctx.status != 0) status = 1;
+        }
+    }
     if (ctxs) {
         for (size_t i = 0; i < threads; ++i) {
+            free(ctxs[i].write_batch);
             if (ctxs[i].counts) counter_free(ctxs[i].counts);
         }
     }
     if (all_counts) counter_free(all_counts);
     free(tids);
     free(ctxs);
-    if (out_mtx_inited) pthread_mutex_destroy(&out_mtx);
+    if (write_queue_inited) cut_write_queue_destroy(&write_queue);
     if (queue_inited) cut_queue_destroy(&queue);
     if (out_opened) fastq_out_close(&out);
     kseq_destroy(ks);
