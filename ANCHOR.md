@@ -1,7 +1,7 @@
 
 ## `ZA:Z` SAM Tag Format
 
-`ZA:Z` is emitted when both `--sam` and `--anchors` are enabled:
+`ZA:Z` is emitted for further debugging when both `--sam` and `--anchors` are enabled: 
 - on mapped SAM records in anchor mode
 - on unmapped (`FLAG 4`) SAM records if anchors were detected but short-reference mapping failed
 - on unmapped (`FLAG 4`) SAM records in two-sided mode when full pairing fails but a single start anchor (`a5` or `a3rc`) is confidently detected (`partial=1`)

@@ -1,10 +1,5 @@
 # Command Line Interface Options
 
-```text
-./cubaTrie [options] 
-./cubaTrie cut [options]
-```
-
 ## `count` Options
 
 | Option | Description | Default |
