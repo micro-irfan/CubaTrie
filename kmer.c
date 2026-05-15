@@ -526,11 +526,25 @@ void find_kmer_bitset(const char *s,
     if (seed_mm < 0) seed_mm = 0;
     if (seed_mm > 1) seed_mm = 1;
 
-    for (size_t i = 0; i + index->k <= s_len; ++i) {
-        uint64_t code;
-        if (encode_kmer(s + i, index->k, &code) < 0) continue;
+    uint64_t code = 0;
+    size_t valid_run = 0;
+    uint64_t mask = ((uint64_t)1u << (2u * index->k)) - 1u;
+
+    for (size_t i = 0; i < s_len; ++i) {
+        int b = nt2bits(s[i]);
+        if (b < 0) {
+            code = 0;
+            valid_run = 0;
+            continue;
+        }
+
+        code = ((code << 2) | (uint64_t)b) & mask;
+        ++valid_run;
+
+        if (valid_run < index->k) continue;
+
         if (seed_match_with_mm(index, code, seed_mm)) {
-            kv_push(uint32_t, 0, *hits, i);
+            kv_push(uint32_t, 0, *hits, (uint32_t)(i + 1u - index->k));
         }
     }
 
