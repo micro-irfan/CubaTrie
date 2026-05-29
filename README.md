@@ -1,8 +1,8 @@
 # cubaTrie
 
-cubaTrie is a Short Reference (20-30bp) Mapper employing Compressed Radix Trie Structure For Querying generic Longer Reads (>50bp) or Larger Sequences like viral sequences to find conserved target sequences. CubaTrie has been tested for quantification of gRNA for CRISPR Cas Pooled Screening and CRISPR Cas Therapeutics/Diagnostics, and quantification of intramolecular homologous recombination between tandem repetitive elements using Long Read Sequencing Technology [workflow](https://github.com/micro-irfan/CubaTrie/blob/main/README.md#Suggested-Workflows).  
+cubaTrie is a Short Reference (20-30bp) Mapper employing Compressed Radix Trie Structure For Querying generic Longer Reads (>50bp) or Larger Sequences like viral sequences to find conserved target sequences. CubaTrie has been tested for quantification of gRNA for CRISPR Cas Pooled Screening and CRISPR Cas Therapeutics/Diagnostics, and quantification of intramolecular homologous recombination between tandem repetitive elements using Long Read Sequencing Technology [workflow](README.md#Suggested-Workflows).  
 
-CubaTrie has two modes - cut and count - which can be performed in a single run. CubaTrie cut trims 5' and 3' flanking region. CubaTrie count maps super short references to reads or sequences of similar or longer length. All CLI options are included on [OPTIONS.md](https://github.com/micro-irfan/CubaTrie/blob/main/OPTIONS.md). We also provide the mapping information for 5' and 3' flanking region under the custom tag `ZA:Z` for futher debugging. More information on Anchors can be found on [ANCHORS.md](https://github.com/micro-irfan/CubaTrie/blob/main/ANCHOR.md).   
+CubaTrie has two modes - cut and count - which can be performed in a single run. CubaTrie cut trims 5' and 3' flanking region. CubaTrie count maps super short references to reads or sequences of similar or longer length. All CLI options are included on [OPTIONS.md](OPTIONS.md). We also provide the mapping information for 5' and 3' flanking region under the custom tag `ZA:Z` for futher debugging. More information on Anchors can be found on [ANCHORS.md](ANCHOR.md).   
 
 Cuba (pronounced as Chew-bah and not the country Q-ba) means to try in the Malay Language. Essentially, the tool means Try Trie*, since Trie Data Structures are not commonly found in Bioinformatics. Since this started out as a side project, I documented the process, the DSA implemented, current limitations, and ad-hoc findings, on my personal pages (Links to be added later). 
 
@@ -37,4 +37,5 @@ cd CubaTrie && make
 ./cubaTrie cut -i ${sample_id}.R1.fastq.gz -o ${sample_id}.R1.trimmed.fastq.gz -a ATTTTCAATTTAACGTCG...GTTTTAGAGCTAGAAATA --anchor-error 3 -m 20 -M 20 -t 4
 ```
 
-
+This project is licensed under the GNU General Public License v3.0.  
+See [LICENSE](LICENSE) for the full text.

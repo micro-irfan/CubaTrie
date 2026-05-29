@@ -36,8 +36,6 @@ class Reference():
 
 class Bam():
     
-    START_SGRNA = 30 # 30 - normal 
-
     cigar_dict = {
             0: "M", # match/mismatch
             1: "I", 
@@ -128,8 +126,12 @@ class Bam():
             
                 self.gene_count[reference_id] += 1
 
-        if software == 'bwa':
-            self.stats['mapped'] = self.stats['read']-self.stats['unmapped']-self.stats['unmapped_mate']
+                
+        self.stats['mapped'] = self.stats['read']-self.stats['unmapped']-self.stats['unmapped_mate']
+        if self.stats['mapped'] == 0:
+            return
+        
+        print (self.stats)
 
         mapped_percent = (self.stats['mapped']/self.stats['read']) * 100
         self.stats['mapped%'] += mapped_percent

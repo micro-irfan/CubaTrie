@@ -43,9 +43,9 @@ class ReadWrapper:
 
 class Bam():
     
-    START_SGRNA = 30 # 30 - normal 
-    anchor5_len = 30
-    anchon3_len = 60
+    START_SGRNA = 22 
+    anchor5_len = 22
+    anchon3_len = 120
     sgrna_length_max = 20
 
     cigar_dict = {
@@ -62,9 +62,9 @@ class Bam():
         }
 
 
-    def __init__(self, bamFile, reference, sample=""):
-        self.bam = bamFile
-        self.sample = bamFile.split('.')[0] if bamFile else sample
+    def __init__(self, bam_file, reference, sample=""):
+        self.bam = bam_file
+        self.sample = bam_file.split('.')[0] if bam_file else sample
         
         
         self.stats = { 
@@ -84,7 +84,7 @@ class Bam():
 
 
     def open_bam(self, software = 'bwa', allow_recheck=True, only_exact=True):
-        cache = dict()
+        cache = {}
         
         ## Counter For Reads that are multimapped
         self.stats['multimapped'] = 0
@@ -124,7 +124,7 @@ class Bam():
                 
                 ## Only One Read Has to be exact match
                 r.to_remove = False
-                if read_id in cache.keys():
+                if read_id in cache:
                     ## Check if exact match - if False - check the paired read
                     to_remove = True
                     if cache[read_id].to_remove:
@@ -156,7 +156,7 @@ class Bam():
                         tag = r.read.get_tag('YT')
                         try:
                             self.stats[tag] += 1
-                        except:
+                        except KeyError:
                             self.stats[tag] = 1
 
                         if tag != 'CP' : 
@@ -167,7 +167,8 @@ class Bam():
                     if r.read.has_tag('SA'): 
                         sa_tag = r.read.get_tag('SA')
                         to_continue = False
-                        for aln in sa_tag.strip(';').split(';'):
+                        for c, aln in enumerate(sa_tag.strip(';').split(';')):
+                            if not c % 2: continue
                             aln = aln.split(',')
                             ref_start_pos = int(aln[1])
                             cigar_tuples = parse_cigar_string(aln[3])
@@ -223,12 +224,12 @@ class Bam():
 
                     try:
                         self.max_gap[max_gap] += 1
-                    except:
+                    except KeyError:
                         self.max_gap[max_gap] = 1
                     
                     try:
                         self.operations[total_operation] += 1
-                    except:
+                    except KeyError:
                         self.operations[total_operation] = 1
                     
                 if to_remove:
@@ -242,10 +243,16 @@ class Bam():
 
                 self.gene_count[reference_id] += 1
 
-        if software == 'bwa':
-            self.stats['mapped'] = self.stats['read']-self.stats['unmapped']-self.stats['unmapped_mate']-self.stats['invalid_ref_start']
-        if software == 'bowtie2':
-            self.stats['mapped'] = self.stats['CP'] - self.stats['invalid_ref_start']
+        self.stats['mapped'] = self.stats['read']-self.stats['unmapped']-self.stats['unmapped_mate']-self.stats['invalid_ref_start']
+        # if software == 'bwa':
+        #     self.stats['mapped'] = self.stats['read']-self.stats['unmapped']-self.stats['unmapped_mate']-self.stats['invalid_ref_start']
+        # if software == 'bowtie2':
+        #     self.stats['mapped'] = self.stats['CP'] - self.stats['invalid_ref_start']
+
+        if self.stats['mapped'] == 0:
+            return
+
+        print (self.stats)
         
         mapped_percent = (self.stats['mapped']/self.stats['read']) * 100
         self.stats['mapped%'] += mapped_percent
@@ -312,7 +319,6 @@ class Bam():
 
             if operation == md_string[c-insert_count]: 
                 adjusted_cigar += operation
-                continue
             else:
                 md_operation = md_string[c-insert_count]
                 adjusted_cigar += md_operation
@@ -358,7 +364,7 @@ def write_output(bam):
 
     max_value = max(list(bam.max_gap.keys()) + list(bam.operations.keys()))
     with open(f'Operations-log.{sample_id}.csv', 'w') as write_file:
-        write_file.write(f'Count,Operations,MaxGap\n')
+        write_file.write('Count,Operations,MaxGap\n')
         for i in range(max_value):
             write_file.write(f'{i},{bam.operations.get(i,0)},{bam.max_gap.get(i,0)}\n')
             

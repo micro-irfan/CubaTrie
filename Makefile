@@ -1,7 +1,9 @@
 # Makefile
 # Usage:
-#   make                # debug + sanitizers (default)
+#   make                # release build (default)
 #   make MODE=release   # optimized build
+#   make MODE=debug     # debug + sanitizers
+#   make PREFIX=$PREFIX install
 #   make clean
 
 # ---- project ----
@@ -17,8 +19,12 @@ TEST_DEPS := $(TEST_TARGET).d $(GOLDEN_TEST_TARGET).d
 
 # ---- toolchain ----
 CC      ?= gcc
+INSTALL ?= install
 CSTD     = -std=c11
 WARN     = -Wall -Wextra -Werror=implicit-function-declaration
+PREFIX  ?= /usr/local
+BINDIR  ?= $(PREFIX)/bin
+DESTDIR ?=
 # (Optional) expose POSIX funcs like strndup/strnlen; uncomment if you use them:
 # CPPFLAGS += -D_POSIX_C_SOURCE=200809L
 CPPFLAGS += -MMD -MP              # auto deps
@@ -32,7 +38,7 @@ MODE ?= release
 ifeq ($(MODE),debug)
   CFLAGS  += -g3 -O0 $(SAN) -D_POSIX_C_SOURCE=200809L
 else ifeq ($(MODE),release)
-  CFLAGS  += -O3 -g -D_POSIX_C_SOURCE=200809L -march=native -DNDEBUG
+  CFLAGS  += -O3 -g -D_POSIX_C_SOURCE=200809L -DNDEBUG
 endif
 
 CFLAGS  += $(CSTD) $(WARN) $(THREAD_FLAGS)
@@ -40,8 +46,10 @@ LDFLAGS += $(THREAD_FLAGS)
 LDLIBS  += -lz                     # zlib
 
 # ---- rules ----
-.PHONY: all clean test golden-test
+.PHONY: all clean test golden-test check install uninstall
 all: $(TARGET)
+
+check: test
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
@@ -52,6 +60,13 @@ $(TARGET): $(OBJS)
 
 clean:
 	$(RM) $(OBJS) $(DEPS) $(TEST_TARGET) $(GOLDEN_TEST_TARGET) $(TEST_DEPS)
+
+install: $(TARGET)
+	$(INSTALL) -d $(DESTDIR)$(BINDIR)
+	$(INSTALL) -m 0755 $(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
+
+uninstall:
+	$(RM) $(DESTDIR)$(BINDIR)/$(TARGET)
 
 test: $(TEST_TARGET)
 	@if [ -x "./$(TEST_TARGET)" ]; then \
